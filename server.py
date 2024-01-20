@@ -1,5 +1,7 @@
-import urllib.parse
+import urllib.parse, subprocess
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
+from tinygrad.runtime.ops_hip import compile_hip
 
 class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
   def do_POST(self):
@@ -7,12 +9,14 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     post_data = self.rfile.read(content_length)
     parsed_data = urllib.parse.parse_qs(post_data.decode('utf-8'))
     code = parsed_data.get('code', [''])[0]
-    print("code: {}", code)
+    lib = compile_hip(code)
+    asm = subprocess.check_output(["/opt/rocm/llvm/bin/llvm-objdump", '-d', '-'], input=lib)
+    asm = '\n'.join([x for x in asm.decode('utf-8').split("\n") if 's_code_end' not in x])
 
     self.send_response(200)
     self.send_header("Content-type", "text/plain")
     self.end_headers()
-    self.wfile.write(b"Code recieved")
+    self.wfile.write(asm.encode())
 
 if __name__ == "__main__":
   server_address = ("", 80)
