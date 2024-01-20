@@ -19,7 +19,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     self.wfile.write(asm.encode())
 
 if __name__ == "__main__":
-  server_address = ("", 80)
+  server_address = ("0.0.0.0", 80)
   httpd = HTTPServer(server_address, SimpleHTTPRequestHandler)
   print("Server started on port 80...")
   httpd.serve_forever()
