@@ -1,7 +1,7 @@
 import urllib.parse, subprocess
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from tinygrad.runtime.ops_hip import compile_hip
+from tinygrad.runtime.support.hip_comgr import compile_hip
 
 class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
   def do_GET(self):
