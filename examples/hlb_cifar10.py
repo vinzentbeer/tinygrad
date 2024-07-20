@@ -11,21 +11,61 @@ from extra.lr_scheduler import OneCycleLR
 from tinygrad import nn, dtypes, Tensor, Device, GlobalCounters, TinyJit
 from tinygrad.nn.state import get_state_dict, get_parameters
 from tinygrad.nn import optim
-from tinygrad.helpers import Context, BEAM, WINO, getenv
+from tinygrad.helpers import Context, BEAM, WINO, getenv, colored, prod
+from tinygrad.multi import MultiLazyBuffer
 
-BS, EVAL_BS, STEPS = getenv("BS", 512), getenv('EVAL_BS', 500), getenv("STEPS", 1000)
+BS, STEPS = getenv("BS", 512), getenv("STEPS", 1000)
+EVAL_BS = getenv("EVAL_BS", BS)
 GPUS = [f'{Device.DEFAULT}:{i}' for i in range(getenv("GPUS", 1))]
-assert BS % len(GPUS) == 0, f"{BS=} is not a multiple of {len(GPUS)=}"
-for x in GPUS: Device[x]
+assert BS % len(GPUS) == 0, f"{BS=} is not a multiple of {len(GPUS)=}, uneven multi GPU is slow"
+assert EVAL_BS % len(GPUS) == 0, f"{EVAL_BS=} is not a multiple of {len(GPUS)=}, uneven multi GPU is slow"
 
-if getenv("HALF"):
-  dtypes.default_float = dtypes.float16
-  np_dtype = np.float16
-else:
-  dtypes.default_float = dtypes.float32
-  np_dtype = np.float32
+class UnsyncedBatchNorm:
+  def __init__(self, sz:int, eps=1e-5, affine=True, track_running_stats=True, momentum=0.1, num_devices=len(GPUS)):
+    self.eps, self.track_running_stats, self.momentum = eps, track_running_stats, momentum
+    self.num_devices = num_devices
 
-class BatchNorm(nn.BatchNorm2d):
+    if affine: self.weight, self.bias = Tensor.ones(sz, dtype=dtypes.float32), Tensor.zeros(sz, dtype=dtypes.float32)
+    else: self.weight, self.bias = None, None
+
+    self.running_mean = Tensor.zeros(num_devices, sz, dtype=dtypes.float32, requires_grad=False)
+    self.running_var = Tensor.ones(num_devices, sz, dtype=dtypes.float32, requires_grad=False)
+    self.num_batches_tracked = Tensor.zeros(1, dtype=dtypes.int, requires_grad=False)
+
+  def __call__(self, x:Tensor):
+    if isinstance(x.lazydata, MultiLazyBuffer): assert x.lazydata.axis is None or x.lazydata.axis == 0 and len(x.lazydata.lbs) == self.num_devices
+
+    xr = x.reshape(self.num_devices, -1, *x.shape[1:]).cast(dtypes.float32)
+    batch_mean, batch_invstd = self.calc_stats(xr)
+    ret = xr.batchnorm(
+      self.weight.reshape(1, -1).expand((self.num_devices, -1)),
+      self.bias.reshape(1, -1).expand((self.num_devices, -1)),
+      batch_mean, batch_invstd, axis=(0, 2))
+    return ret.reshape(x.shape).cast(x.dtype)
+
+  def calc_stats(self, x:Tensor):
+    if Tensor.training:
+      # This requires two full memory accesses to x
+      # https://github.com/pytorch/pytorch/blob/c618dc13d2aa23625cb0d7ada694137532a4fa33/aten/src/ATen/native/cuda/Normalization.cuh
+      # There's "online" algorithms that fix this, like https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Welford's_Online_algorithm
+      batch_mean = x.mean(axis=(1,3,4))
+      y = (x - batch_mean.detach().reshape(shape=[batch_mean.shape[0], 1, -1, 1, 1]))  # d(var)/d(mean) = 0
+      batch_var = (y*y).mean(axis=(1,3,4))
+      batch_invstd = batch_var.add(self.eps).pow(-0.5)
+
+      # NOTE: wow, this is done all throughout training in most PyTorch models
+      if self.track_running_stats:
+        self.running_mean.assign((1-self.momentum) * self.running_mean + self.momentum * batch_mean.detach().cast(self.running_mean.dtype))
+        batch_var_adjust = prod(y.shape[1:])/(prod(y.shape[1:])-y.shape[2])
+        self.running_var.assign((1-self.momentum) * self.running_var + self.momentum * batch_var_adjust * batch_var.detach().cast(self.running_var.dtype))
+        self.num_batches_tracked += 1
+    else:
+      batch_mean = self.running_mean
+      # NOTE: this can be precomputed for static inference. we expand it here so it fuses
+      batch_invstd = self.running_var.reshape(self.running_var.shape[0], 1, -1, 1, 1).expand(x.shape).add(self.eps).rsqrt()
+    return batch_mean, batch_invstd
+
+class BatchNorm(nn.BatchNorm2d if getenv("SYNCBN") else UnsyncedBatchNorm):
   def __init__(self, num_features):
     super().__init__(num_features, track_running_stats=False, eps=1e-12, momentum=0.85, affine=True)
     self.weight.requires_grad = False
@@ -112,7 +152,6 @@ def train_cifar():
     random.seed(seed)
 
   # ========== Model ==========
-  # NOTE: np.linalg.eigh only supports float32 so the whitening layer weights need to be converted to float16 manually
   def whitening(X, kernel_size=hyp['net']['kernel_size']):
     def _cov(X):
       return (X.T @ X) / (X.shape[0] - 1)
@@ -129,10 +168,11 @@ def train_cifar():
       Λ, V = np.linalg.eigh(Σ, UPLO='U')
       return np.flip(Λ, 0), np.flip(V.T.reshape(c*h*w, c, h, w), 0)
 
-    Λ, V = _eigens(_patches(X.numpy()))
+    # NOTE: np.linalg.eigh only supports float32 so the whitening layer weights need to be converted to float16 manually
+    Λ, V = _eigens(_patches(X.float().numpy()))
     W = V/np.sqrt(Λ+1e-2)[:,None,None,None]
 
-    return Tensor(W.astype(np_dtype), requires_grad=False)
+    return Tensor(W.astype(np.float32), requires_grad=False).cast(dtypes.default_float)
 
   # ========== Loss ==========
   def cross_entropy(x:Tensor, y:Tensor, reduction:str='mean', label_smoothing:float=0.0) -> Tensor:
@@ -157,8 +197,8 @@ def train_cifar():
     BS, _, H, W = shape
     low_x = Tensor.randint(BS, low=0, high=W-mask_size).reshape(BS,1,1,1)
     low_y = Tensor.randint(BS, low=0, high=H-mask_size).reshape(BS,1,1,1)
-    idx_x = Tensor.arange(W).reshape((1,1,1,W))
-    idx_y = Tensor.arange(H).reshape((1,1,H,1))
+    idx_x = Tensor.arange(W, dtype=dtypes.int32).reshape((1,1,1,W))
+    idx_y = Tensor.arange(H, dtype=dtypes.int32).reshape((1,1,H,1))
     return (idx_x >= low_x) * (idx_x < (low_x + mask_size)) * (idx_y >= low_y) * (idx_y < (low_y + mask_size))
 
   def random_crop(X:Tensor, crop_size=32):
@@ -172,8 +212,8 @@ def train_cifar():
     mask = make_square_mask(X.shape, mask_size)
     order = list(range(0, X.shape[0]))
     random.shuffle(order)
-    X_patch = Tensor(X.numpy()[order], device=X.device)
-    Y_patch = Tensor(Y.numpy()[order], device=Y.device)
+    X_patch = Tensor(X.numpy()[order], device=X.device, dtype=X.dtype)
+    Y_patch = Tensor(Y.numpy()[order], device=Y.device, dtype=Y.dtype)
     X_cutmix = mask.where(X_patch, X)
     mix_portion = float(mask_size**2)/(X.shape[-2]*X.shape[-1])
     Y_cutmix = mix_portion * Y_patch + (1. - mix_portion) * Y
@@ -204,8 +244,8 @@ def train_cifar():
       for i in range(0, X.shape[0], BS):
         # pad the last batch  # TODO: not correct for test
         batch_end = min(i+BS, Y.shape[0])
-        x = Tensor(X[batch_end-BS:batch_end], device=X_in.device)
-        y = Tensor(Y[batch_end-BS:batch_end], device=Y_in.device)
+        x = Tensor(X[batch_end-BS:batch_end], device=X_in.device, dtype=X_in.dtype)
+        y = Tensor(Y[batch_end-BS:batch_end], device=Y_in.device, dtype=Y_in.dtype)
         step += 1
         yield x, y
       epoch += 1
@@ -213,7 +253,8 @@ def train_cifar():
 
   transform = [
     lambda x: x / 255.0,
-    lambda x: (x.reshape((-1,3,32,32)) - Tensor(cifar_mean).reshape((1,3,1,1)))/Tensor(cifar_std).reshape((1,3,1,1))
+    lambda x: x.reshape((-1,3,32,32)) - Tensor(cifar_mean, device=x.device, dtype=x.dtype).reshape((1,3,1,1)),
+    lambda x: x / Tensor(cifar_std, device=x.device, dtype=x.dtype).reshape((1,3,1,1)),
   ]
 
   class modelEMA():
@@ -259,8 +300,11 @@ def train_cifar():
   X_test, Y_test = X_test.cast(dtypes.default_float), Y_test.cast(dtypes.default_float)
 
   if len(GPUS) > 1:
-    for x in get_parameters(model):
-      x.to_(GPUS)
+    for k, x in get_state_dict(model).items():
+      if not getenv('SYNCBN') and ('running_mean' in k or 'running_var' in k):
+        x.shard_(GPUS, axis=0)
+      else:
+        x.to_(GPUS)
 
   # parse the training params into bias and non-bias
   params_dict = get_state_dict(model)
@@ -290,12 +334,9 @@ def train_cifar():
 
     if not getenv("DISABLE_BACKWARD"):
       # index 0 for bias and 1 for non-bias
-      optimizer[0].zero_grad()
-      optimizer[1].zero_grad()
+      optimizer.zero_grad()
       loss.backward()
-
-      optimizer[0].step()
-      optimizer[1].step()
+      optimizer.step()
       lr_scheduler[0].step()
       lr_scheduler[1].step()
     return loss.realize()
@@ -322,6 +363,7 @@ def train_cifar():
   model_ema: Optional[modelEMA] = None
   projected_ema_decay_val = hyp['ema']['decay_base'] ** hyp['ema']['every_n_steps']
   i = 0
+  eval_acc_pct = 0.0
   batcher = fetch_batches(X_train, Y_train, BS=BS, is_train=True)
   with Tensor.train():
     st = time.monotonic()
@@ -349,9 +391,9 @@ def train_cifar():
         correct_sum, correct_len = sum(corrects), len(corrects)
         if model_ema: correct_sum_ema, correct_len_ema = sum(corrects_ema), len(corrects_ema)
 
-        acc = correct_sum/correct_len*100.0
+        eval_acc_pct = correct_sum/correct_len*100.0
         if model_ema: acc_ema = correct_sum_ema/correct_len_ema*100.0
-        print(f"eval     {correct_sum}/{correct_len} {acc:.2f}%, {(sum(losses)/len(losses)):7.2f} val_loss STEP={i} (in {(time.monotonic()-st)*1e3:.2f} ms)")
+        print(f"eval     {correct_sum}/{correct_len} {eval_acc_pct:.2f}%, {(sum(losses)/len(losses)):7.2f} val_loss STEP={i} (in {(time.monotonic()-st)*1e3:.2f} ms)")
         if model_ema: print(f"eval ema {correct_sum_ema}/{correct_len_ema} {acc_ema:.2f}%, {(sum(losses_ema)/len(losses_ema)):7.2f} val_loss STEP={i}")
 
       if STEPS == 0 or i == STEPS: break
@@ -363,7 +405,7 @@ def train_cifar():
         Y.shard_(GPUS, axis=0)
 
       with Context(BEAM=getenv("LATEBEAM", BEAM.value), WINO=getenv("LATEWINO", WINO.value)):
-        loss = train_step_jitted(model, [opt_bias, opt_non_bias], [lr_sched_bias, lr_sched_non_bias], X, Y)
+        loss = train_step_jitted(model, optim.OptimizerGroup(opt_bias, opt_non_bias), [lr_sched_bias, lr_sched_non_bias], X, Y)
         et = time.monotonic()
         loss_cpu = loss.numpy()
       # EMA for network weights
@@ -377,6 +419,13 @@ def train_cifar():
       print(f"{i:3d} {(cl-st)*1000.0:7.2f} ms run, {(et-st)*1000.0:7.2f} ms python, {(cl-et)*1000.0:7.2f} ms {device_str}, {loss_cpu:7.2f} loss, {opt_non_bias.lr.numpy()[0]:.6f} LR, {GlobalCounters.mem_used/1e9:.2f} GB used, {GlobalCounters.global_ops*1e-9/(cl-st):9.2f} GFLOPS, {GlobalCounters.global_ops*1e-9:9.2f} GOPS")
       st = cl
       i += 1
+
+  # verify eval acc
+  if target := getenv("TARGET_EVAL_ACC_PCT", 0.0):
+    if eval_acc_pct >= target:
+      print(colored(f"{eval_acc_pct=} >= {target}", "green"))
+    else:
+      raise ValueError(colored(f"{eval_acc_pct=} < {target}", "red"))
 
 if __name__ == "__main__":
   train_cifar()

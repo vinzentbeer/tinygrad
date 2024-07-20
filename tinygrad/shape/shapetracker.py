@@ -1,28 +1,10 @@
 # ShapeTracker allows movement operations to a buffer that don't require a copy to be made.
 from __future__ import annotations
-import functools
 from dataclasses import dataclass
-from typing import Tuple, List, Optional, Dict, Set, cast, Iterable, Union
+from typing import Tuple, List, Optional, Dict, Set, Iterable, cast
 from tinygrad.helpers import merge_dicts, getenv
 from tinygrad.shape.symbolic import Variable, MulNode, Node, SumNode, NumNode, sint
-from tinygrad.shape.view import View
-
-@functools.lru_cache(maxsize=None)
-def merge_views(vm2:View, vm1:View) -> Optional[View]:
-  if vm1.contiguous and vm1.shape == vm2.shape: return vm2
-  if vm2.contiguous: return vm1
-  if vm2.mask or vm1.offset != 0: return None  # this isn't supported yet
-  if None in (strides := ShapeTracker((vm2, vm1)).real_strides()): return None
-  return View.create(vm1.shape, cast(Tuple[sint, ...], strides), vm2.offset, vm1.mask)
-
-def _expr_view(view:View, idxs:List[Node], valid:Optional[Node]=None) -> Tuple[Node, Node]:
-  assert len(idxs) == len(view.shape), f"need an idx for all dimensions {idxs} vs {view.shape}"
-  iexpr: List[Node] = [NumNode(view.offset) if isinstance(view.offset, int) else view.offset]
-  vexpr: List[Node] = [valid] if valid is not None else []
-  for idx,sh,st,m in zip(idxs, view.shape, view.strides, view.mask if view.mask is not None else [None]*len(view.shape)):
-    if sh != 1 and st != 0: iexpr.append(idx*st)
-    if m is not None: vexpr += [idx >= m[0], idx < m[1]]
-  return Node.sum(iexpr), Node.ands(vexpr)
+from tinygrad.shape.view import View, strides_for_shape
 
 @dataclass(frozen=True)
 class ShapeTracker:
@@ -34,14 +16,20 @@ class ShapeTracker:
     return ret
 
   def invert(self, out_shape:Tuple[sint, ...]) -> Optional[ShapeTracker]:
-    ret = tuple(v.invert(s) for v,s in zip(self.views[::-1], [x.shape for x in self.views[::-1][1:]]+[out_shape]))
-    return ShapeTracker(cast(Tuple[View, ...], ret)).reshape(out_shape) if all(x is not None for x in ret) else None
+    inverted_views:List[View] = []
+    for v,s in zip(self.views[::-1], [x.shape for x in self.views[::-1][1:]]+[out_shape]):
+      if (inverted:= v.invert(s)) is None: return None
+      inverted_views.append(inverted)
+    return ShapeTracker(tuple(inverted_views)).reshape(out_shape)
 
   @staticmethod
   def from_shape(shape:Tuple[sint, ...]): return ShapeTracker((View.create(shape),))
 
   @property
   def contiguous(self) -> bool: return len(self.views) == 1 and self.views[0].contiguous
+
+  @property
+  def consecutive(self) -> bool: return len(self.views) == 1 and (v:=self.views[0]).mask is None and v.strides == strides_for_shape(v.shape)
 
   @property
   def shape(self) -> Tuple[sint, ...]: return self.views[-1].shape
@@ -51,8 +39,11 @@ class ShapeTracker:
 
   def real_size(self) -> int:
     if 0 in self.shape: return 0
-    ret = cast(Union[int, Node], self.expr_idxs()[0].max)   # TODO: this is due to typing issues in symbolic!
-    while not isinstance(ret, int): ret = ret.max    # TODO: this is a while loop?!? it should be more clear what max does
+    idx, valid = self.expr_idxs()
+    if not valid: return 0
+    # TODO: it's possible that the real_size is smaller condition on valid being true
+    ret = idx.max
+    if not isinstance(ret, int): ret = ret.max  # might be represent by symbolic shape, take one more max for int max
     assert isinstance(ret, int), f"ret must be integer, {ret=} isn't"
     return ret+1
 
@@ -74,7 +65,7 @@ class ShapeTracker:
     bad_idx_vars: Set[Variable] = set()
     for this_dim in (idx.nodes if isinstance(idx, SumNode) else [idx]):
       idx_maybe, stride_maybe = (this_dim.a, this_dim.b) if isinstance(this_dim, MulNode) else (this_dim, 1)
-      try: ret[idxs.index(idx_maybe)] = stride_maybe
+      try: ret[idxs.index(idx_maybe)] = cast(sint, stride_maybe)
       except ValueError: bad_idx_vars = bad_idx_vars.union(idx_maybe.vars())
     idx_vars, valid_vars = idx.vars(), valid.vars()
     for i,tidx in enumerate(idxs):
@@ -86,7 +77,7 @@ class ShapeTracker:
 
   def expr_idxs(self, idxs:Optional[Iterable[Node]]=None) -> Tuple[Node, Node]:
     idxs = [Variable(f"idx{i}", 0, s-1) for i,s in enumerate(self.shape)] if idxs is None else list(idxs)
-    idx, valid = _expr_view(self.views[-1], idxs)
+    idx, valid = self.views[-1].expr(idxs)
     for view in reversed(self.views[0:-1]):
       if valid.max == 0: return NumNode(-1), valid
       view = view.minify()
@@ -94,7 +85,9 @@ class ShapeTracker:
       for d in reversed(view.shape):
         idxs.append((idx//acc)%d)
         acc *= d
-      idx, valid = _expr_view(view, idxs[::-1], valid)
+      idx, valid = view.expr(idxs[::-1], valid)
+    assert not isinstance(idx.min, int) or idx.min >= -2**31, f"idx.min too small. {idx=}, {idx.min=}"
+    assert not isinstance(idx.max, int) or idx.max < 2**31, f"idx.max too big. {idx=}, {idx.max=}"
     return idx, valid
 
   def axis_is_masked(self, axis:int) -> bool:
@@ -102,7 +95,7 @@ class ShapeTracker:
     return f'idx{axis}' in [v.expr for v in valid.vars()]
 
   def simplify(self) -> ShapeTracker:
-    if len(self.views) >= 2 and (new_view := merge_views(self.views[-2], self.views[-1])) is not None:
+    if len(self.views) >= 2 and (new_view := self.views[-2] + self.views[-1]) is not None:
       return ShapeTracker(self.views[:-2] + (new_view,)).simplify()
     return self
 

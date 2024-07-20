@@ -1,8 +1,7 @@
 import numpy as np
-from tqdm import trange
 from tinygrad.tensor import Tensor
-from tinygrad.helpers import CI
-from tinygrad.jit import TinyJit
+from tinygrad.helpers import CI, trange
+from tinygrad.engine.jit import TinyJit
 
 
 def train(model, X_train, Y_train, optim, steps, BS=128, lossfn=lambda out,y: out.sparse_categorical_crossentropy(y),

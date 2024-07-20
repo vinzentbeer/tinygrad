@@ -2,7 +2,7 @@
 import unittest
 import numpy as np
 from tinygrad import Tensor, dtypes
-from tinygrad.jit import TinyJit
+from tinygrad.engine.jit import TinyJit
 from tinygrad.helpers import CI
 from test.helpers import derandomize_model
 
@@ -30,8 +30,8 @@ class TestJittedModels(unittest.TestCase):
 
   @unittest.skipUnless(not CI, "huge for CI")
   def test_jitted_stable_diffusion(self):
-    from examples.stable_diffusion import UNetModel
-    model = UNetModel()
+    from examples.stable_diffusion import UNetModel, unet_params
+    model = UNetModel(**unet_params)
     derandomize_model(model)
     def test(t, t2): return model(t, 801, t2).realize()
 

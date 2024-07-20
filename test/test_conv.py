@@ -1,6 +1,6 @@
 import unittest
 import numpy as np
-from tinygrad.tensor import Tensor, Device
+from tinygrad.tensor import Tensor
 from tinygrad.helpers import Context
 
 class TestConv(unittest.TestCase):
@@ -42,6 +42,14 @@ class TestConv(unittest.TestCase):
 
     print(ret.numpy())
 
+  def test_two_binops_no_rerun_small(self):
+    Tensor.no_grad = True
+    x = Tensor.rand(1,1,32,32)
+    w = Tensor.rand(1,1,3,3)
+    out = x.conv2d(w, padding=(1,1))
+    np.testing.assert_allclose(out.relu().numpy(), np.maximum(out.numpy(), 0))
+    Tensor.no_grad = False
+
   def test_two_binops_no_rerun(self):
     Tensor.no_grad = True
     x = Tensor.randn(1,12,128,256)
@@ -62,7 +70,6 @@ class TestConv(unittest.TestCase):
     np.testing.assert_allclose(r2.numpy(), np.where(out.numpy() > 0, out.numpy(), (np.exp(out.numpy()) - 1)), atol=1e-5)
     Tensor.no_grad = False
 
-  @unittest.skipIf(Device.DEFAULT != "TORCH", "Takes too long to compile for Compiled backends")
   def test_two_overlapping_binops_no_rerun_wino(self):
     Tensor.no_grad = True
     with Context(WINO=1):

@@ -1,17 +1,12 @@
 from __future__ import annotations
-from collections import defaultdict
-from typing import TYPE_CHECKING, Union, Any, List, Optional, Dict, Callable, Tuple, cast, ClassVar
-import importlib, inspect, functools, pathlib, time, re, ctypes
-from tinygrad.dtype import DType, ImageDType
-from tinygrad.helpers import ansilen, DEBUG, getenv, colored, BEAM, NOOPT, all_int, to_function_name, from_mv, flat_mv, diskcache_get, diskcache_put
-from tinygrad.shape.shapetracker import ShapeTracker
-from tinygrad.shape.symbolic import Variable, sym_infer, sint
-from tinygrad.ops import LazyOp, TernaryOps, get_lazyop_info, ReduceOps, BufferOps, BinaryOps, UnaryOps, Op, GlobalCounters, MovementOps
+import multiprocessing
 from dataclasses import dataclass
-
-if TYPE_CHECKING:
-  from tinygrad.codegen.linearizer import Linearizer
-  from tinygrad.codegen.kernel import LinearizerOptions
+from collections import defaultdict
+from typing import List, Optional, Dict, Tuple, Any, cast, Protocol, Type
+import importlib, inspect, functools, pathlib, os, ctypes, atexit, time, contextlib, array
+from tinygrad.helpers import SAVE_SCHEDULE, getenv, diskcache_get, diskcache_put, DEBUG, GlobalCounters, flat_mv, from_mv, ProfileLogger, PROFILE
+from tinygrad.dtype import DType, ImageDType
+from tinygrad.renderer import Renderer
 
 # **************** Device ****************
 
@@ -21,131 +16,134 @@ class _Device:
   def _canonicalize(self, device:str) -> str: return (device.split(":", 1)[0].upper() + ((":"+device.split(":", 1)[1]) if ':' in device else '')).replace(":0", "")   # noqa: E501
   # NOTE: you can't cache canonicalize in case Device.DEFAULT changes
   def canonicalize(self, device:Optional[str]) -> str: return self._canonicalize(device) if device is not None else Device.DEFAULT
-  def __getitem__(self, ix:str) -> Union[Interpreted, Compiled]: return self.__get_canonicalized_item(self.canonicalize(ix))
+  def __getitem__(self, ix:str) -> Compiled: return self.__get_canonicalized_item(self.canonicalize(ix))
   @functools.lru_cache(maxsize=None)  # this class is a singleton, pylint: disable=method-cache-max-size-none
-  def __get_canonicalized_item(self, ix:str) -> Union[Interpreted, Compiled]:
+  def __get_canonicalized_item(self, ix:str) -> Compiled:
+    assert ((cpn:=multiprocessing.current_process().name) == "MainProcess") or ix.split(":")[0] in ["DISK", "NPY"], \
+      f"can only open device {ix} from parent, not {cpn}"
     x = ix.split(":")[0].upper()
-    return [cls for cname, cls in inspect.getmembers(importlib.import_module(f'tinygrad.runtime.ops_{x.lower()}')) if (cname.lower() == x.lower() + "device") and x in self._devices][0](ix)  # noqa: E501
+    ret = [cls for cname, cls in inspect.getmembers(importlib.import_module(f'tinygrad.runtime.ops_{x.lower()}')) if (cname.lower() == x.lower() + "device") and x in self._devices][0](ix)  # noqa: E501
+    if DEBUG >= 1: print(f"opened device {ix} from pid:{os.getpid()}")
+    return ret
   @functools.cached_property
   def DEFAULT(self) -> str:
     device_from_env: Optional[str] = functools.reduce(lambda val, ele: ele if getenv(ele) == 1 else val, self._devices, None)   # type: ignore
     if device_from_env: return device_from_env
-    for device in ["METAL", "CUDA", "HIP", "GPU"]:
+    for device in ["METAL", "AMD", "NV", "CUDA", "GPU", "CLANG", "LLVM"]:
       try:
-        if self[device]: return device
+        if self[device]:
+          os.environ[device] = "1"   # we set this in environment for spawned children
+          return device
       except Exception: pass
-    return "CPU"
+    raise RuntimeError("no usable devices")
 Device = _Device()
 
-# **************** base Runner + helpers ****************
-
-class JITRunner:
-  def __init__(self): self.op_estimate, self.mem_estimate = 0, 0
-  def exec(self, rawbufs:List[Buffer], var_vals:Optional[Dict[Variable, int]]=None) -> Optional[float]:
-    var_vals = var_vals if var_vals is not None else {}
-    from tinygrad.jit import CacheCollector
-    et = self(rawbufs, var_vals)
-    CacheCollector.add(self, rawbufs, var_vals)
-    return et
-  def __call__(self, rawbufs:List[Buffer], var_vals:Dict[Variable, int], wait=False, jit=False) -> Optional[float]:
-    raise NotImplementedError("override this")
-
-def update_stats(name:str, op_estimate:sint, mem_estimate:int, var_vals: Optional[Dict[Variable, int]], et: Optional[float], buf_count:int, jit=False, num_kernels=1, lra: Optional[Dict]=None, device:str="", first_run=False):  # noqa: E501
-  if var_vals is None: var_vals = {}
-  op_estimate = sym_infer(op_estimate, var_vals)
-  GlobalCounters.kernel_count += num_kernels
-  GlobalCounters.global_ops += op_estimate
-  GlobalCounters.global_mem += mem_estimate
-  if et is not None: GlobalCounters.time_sum_s += et
-  if DEBUG >= 2:
-    ptm = (colored(f"{et*1e3:9.2f}ms", "yellow") if et > 0.01 else f"{et*1e6:9.2f}us") if et is not None else ""
-    print(f"{colored(f'*** {device[:7]:7s} {GlobalCounters.kernel_count:4d}', ('magenta' if num_kernels == 1 else 'CYAN') if jit else ('green' if first_run else None))} {name+' '*(38-ansilen(name))} arg {buf_count:3d} mem {GlobalCounters.mem_used/1e9:5.2f} GB " +  # noqa: E501
-          (str() if et is None else f"tm {ptm}/{GlobalCounters.time_sum_s*1e3:9.2f}ms ({op_estimate/((et or 1e-20)*1e9):8.2f} GFLOPS, {mem_estimate/((et or 1e-20)*1e9):7.2f} GB/s)"))  # noqa: E501
-
-# **************** Buffer / Allocator ****************
+# **************** Buffer + Allocators ****************
 
 @dataclass(frozen=True, eq=True)
 class BufferOptions:
   image: Optional[ImageDType] = None
   uncached: bool = False
+  cpu_access: bool = False
   host: bool = False
-  signal: bool = False
+  nolru: bool = False
 
 class Buffer:
-  def __init__(self, device:str, size:int, dtype:DType, opaque:Any=None, options:Optional[BufferOptions]=None):
+  def __init__(self, device:str, size:int, dtype:DType, opaque:Any=None, options:Optional[BufferOptions]=None,
+               initial_value:Optional[bytes]=None, lb_refcount=0, base:Optional[Buffer]=None, offset:int=0, preallocate=False):
     assert isinstance(dtype, DType)
     if isinstance(dtype, ImageDType): options = BufferOptions(image=dtype) # TODO: image hack shouldn't be here. where should it be?
-    self.device, self.size, self.dtype, self.d, self.options = device, size, dtype, Device[device], options
-    self.allocator = self.d.allocator
-    self._buf = opaque if opaque is not None else self.allocator.alloc(self.nbytes, options)
-    # TODO: mem_used for all devices
-    if not self.device.startswith("DISK"): GlobalCounters.mem_used += self.nbytes
+    self.device, self.size, self.dtype, self.options, self.offset = device, size, dtype, options, offset
+    if base is None:
+      assert offset == 0, "base buffers can't have offset"
+      self._base = None
+      self._lb_refcount = lb_refcount
+      if opaque is not None: self.allocate(opaque)
+      if initial_value is not None:
+        self.allocate()
+        self.copyin(memoryview(initial_value))
+    else:
+      assert base._base is None, "base can't have a base"
+      assert device == base.device, "base must have the same device"
+      self._base = base
+    if preallocate: self.allocate()
+  @property
+  def base(self) -> Buffer: return self._base if self._base is not None else self
+  @property
+  def lb_refcount(self): return self.base._lb_refcount
+  def ref(self, cnt): self.base._lb_refcount += cnt
+  def is_allocated(self) -> bool: return hasattr(self, '_buf')
+  def ensure_allocated(self) -> Buffer: return self.allocate() if not hasattr(self, '_buf') else self
+  def allocate(self, opaque=None) -> Buffer:
+    assert not hasattr(self, '_buf'), "can't allocate already allocated buffer"
+    self.allocator = Device[self.device].allocator
+    if self._base is not None:
+      self._base.ensure_allocated()
+      assert hasattr(self.allocator, "offset"), "offset function required for view"
+      self._buf: Any = self.allocator.offset(self.base._buf, self.nbytes, self.offset)
+    else:
+      self._buf = opaque if opaque is not None else self.allocator.alloc(self.nbytes, self.options)
+      if not self.device.startswith("DISK"): GlobalCounters.mem_used += self.nbytes
+    return self
+  def __reduce__(self):
+    buf = None
+    if self._base is not None:
+      return self.__class__, (self.device, self.size, self.dtype, None, None, None, 0, self.base, self.offset, hasattr(self, '_buf'))
+    if self.device == "NPY": return self.__class__, (self.device, self.size, self.dtype, self._buf, self.options, None, self.lb_refcount)
+    if self.is_allocated() and not SAVE_SCHEDULE:
+      buf = bytearray(self.nbytes)
+      self.copyout(memoryview(buf))
+    return self.__class__, (self.device, self.size, self.dtype, None, self.options, buf, self.lb_refcount)
   @property
   def nbytes(self): return self.size*self.dtype.itemsize
   def __del__(self):
-    if not hasattr(self, '_buf'): return # happens when __init__ has raised exception
-    if not self.device.startswith("DISK"): GlobalCounters.mem_used -= self.nbytes
-    self.allocator.free(self._buf, self.nbytes, self.options)
-  def __repr__(self): return f"<buf device:{self.device} size:{self.size} dtype:{self.dtype}" + (">" if self.options is None else f"{self.options=}>")
+    if not hasattr(self, '_buf'): return
+    if self._base is None:
+      if not self.device.startswith("DISK"): GlobalCounters.mem_used -= self.nbytes
+      self.allocator.free(self._buf, self.nbytes, self.options)
+  def __repr__(self):
+    return f"<buf real:{hasattr(self, '_buf')} device:{self.device} size:{self.size} dtype:{self.dtype}" + \
+           (f" offset:{self.offset}" if hasattr(self, "base") else "") + \
+           (">" if self.options is None else f" {self.options=}>")
   def as_buffer(self, allow_zero_copy=False, force_zero_copy=False) -> memoryview:
     # zero copy with as_buffer (disabled by default due to use after free)
     if (force_zero_copy or allow_zero_copy) and hasattr(self.allocator, 'as_buffer'): return self.allocator.as_buffer(self._buf)
     assert not force_zero_copy, "force zero copy was passed, but copy is required"
-    return self.copyout(memoryview(bytearray(self.size*self.dtype.itemsize)))
+    return self.copyout(memoryview(bytearray(self.nbytes)))
   def copyin(self, mv:memoryview):
     mv = flat_mv(mv)
     assert len(mv) == self.nbytes, f"size mismatch, {len(mv)=} != {self.dtype=} {self.size=}"
+    assert self.is_allocated(), "can't copyin to unallocated buffer"
     self.allocator.copyin(self._buf, mv)
     return self
   def copyout(self, mv:memoryview) -> memoryview:
     mv = flat_mv(mv)
     assert len(mv) == self.nbytes, f"size mismatch, {len(mv)=} != {self.dtype=} {self.size=}"
+    assert self.is_allocated(), "can't copyout unallocated buffer"
     self.allocator.copyout(mv, self._buf)
     return mv
-
-class BufferCopy(JITRunner):
-  def copy(self, dest, src): dest.copyin(src.as_buffer(allow_zero_copy=True))  # may allocate a CPU buffer depending on allow_zero_copy
-  def __call__(self, rawbufs:List[Buffer], var_vals:Dict[Variable, int], wait=False, jit=False):
-    dest, src = rawbufs[0:2]
-    assert dest.size == src.size and dest.dtype == src.dtype, f"buffer copy mismatch, {dest.size} != {src.size}, {dest.dtype} != {src.dtype}"
-    st = time.perf_counter()
-    self.copy(dest, src)
-    et = None
-    if wait or DEBUG >= 2:
-      dest.d.synchronize()
-      et = time.perf_counter() - st
-    update_stats(colored(f"{type(self).__name__[6:].lower()} {dest.size*dest.dtype.itemsize:8d}, {dest.device[:7]:>7s} <- {src.device[:7]:7s}",
-                         "yellow"), 0, dest.size*dest.dtype.itemsize, {}, et, 2, jit, device=dest.device)
-
-class BufferRead(BufferCopy):
-  def copy(self, dest, src):
-    if hasattr(dest.allocator, 'copy_from_fd') and src.device.startswith("DISK") and src.nbytes >= 4096 and src._buf.ud.fd is not None:
-      dest.allocator.copy_from_fd(dest._buf, src._buf.ud.fd, src._buf.offset, src.nbytes)
-    elif hasattr(dest.allocator, 'as_buffer'):
-      # fast(ish) path, uses readinto in diskbuffers
-      src.allocator.copyout(dest.allocator.as_buffer(dest._buf), src._buf)
-    else: super().copy(dest, src)
-
-class BufferXfer(BufferCopy):
-  def copy(self, dest, src):
-    if hasattr(dest.allocator.device, "track_cross_buffer") and hasattr(src.allocator, "track_cross_device"):
-      dest.allocator.device.track_cross_buffer.append(src)
-      src.allocator.track_cross_device.append(dest.allocator.device)
-    dest.allocator.transfer(dest._buf, src._buf, dest.nbytes)
+  def view(self, size:int, dtype:DType, offset:int) -> Buffer:
+    assert offset < self.nbytes, "offset must be less than nbytes"
+    if self._base is not None: return Buffer(self.device, size, dtype, base=self._base, offset=self.offset+offset)
+    return Buffer(self.device, size, dtype, base=self, offset=offset)
 
 # TODO: size, dest, src are the same type. can we enforce this?
 class Allocator:
   def alloc(self, size:int, options:Optional[BufferOptions]=None):
     assert not isinstance(size, int) or size > 0, f"alloc size must be positve, getting {size}"
-    return self._alloc_with_options(size, options) if options is not None else self._alloc(size)
-  def _alloc(self, size:int): raise NotImplementedError("need alloc")
-  def _alloc_with_options(self, size:int, options:BufferOptions): return self._alloc(size)  # TODO: override this if you support options
-  def free(self, opaque, size:int, options:Optional[BufferOptions]=None): self._free(opaque)
-  def _free(self, opaque): pass  # if opaque is a Python object, you don't need a free
+    return self._alloc(size, options if options is not None else BufferOptions())
+  def _alloc(self, size:int, options:BufferOptions): raise NotImplementedError("need alloc")
+  def free(self, opaque, size:int, options:Optional[BufferOptions]=None):
+    self._free(opaque, options if options is not None else BufferOptions())
+  def _free(self, opaque, options:BufferOptions): pass  # if opaque is a Python object, you don't need a free
   def copyin(self, dest, src:memoryview): raise NotImplementedError("need copyin")
   def copyout(self, dest:memoryview, src): raise NotImplementedError("need copyout")
 
 class LRUAllocator(Allocator):  # pylint: disable=abstract-method
+  """
+  The LRU Allocator is responsible for caching buffers.
+  It ensures that buffers are not freed until it is absolutely necessary, optimizing performance.
+  """
   def __init__(self): self.cache: Dict[Tuple[int, Optional[BufferOptions]], Any] = defaultdict(list)
   def alloc(self, size:int, options:Optional[BufferOptions]=None):
     if len(c := self.cache[(size, options)]): return c.pop()
@@ -154,196 +152,393 @@ class LRUAllocator(Allocator):  # pylint: disable=abstract-method
       self.free_cache()
       return super().alloc(size, options)
   def free_cache(self):
-    for opaques in self.cache.values():
-      for opaque in opaques: self._free(opaque)
+    for (sz,options),opaques in self.cache.items():
+      for opaque in opaques: super().free(opaque, sz, options)
       opaques.clear()
   def free(self, opaque:Any, size:int, options:Optional[BufferOptions]=None):
-    if getenv("LRU", 1) and (options is None or not options.signal): self.cache[(size, options)].append(opaque)
-    else: self._free(opaque)
+    if getenv("LRU", 1) and (options is None or not options.nolru): self.cache[(size, options)].append(opaque)
+    else: super().free(opaque, size, options)
 
 class _MallocAllocator(LRUAllocator):
-  def _alloc(self, size:int): return (ctypes.c_uint8 * size)()
+  def _alloc(self, size:int, options:BufferOptions): return (ctypes.c_uint8 * size)()
   def as_buffer(self, src) -> memoryview: return flat_mv(memoryview(src))
   def copyin(self, dest, src:memoryview): ctypes.memmove(dest, from_mv(src), len(src))
   def copyout(self, dest:memoryview, src): ctypes.memmove(from_mv(dest), src, len(dest))
+  def offset(self, buf, size:int, offset:int): return from_mv(self.as_buffer(buf)[offset:offset+size])
+
 MallocAllocator = _MallocAllocator()
-
-# **************** for Interpreted Devices ****************
-
-class InterpretedASTRunner(JITRunner):
-  def __init__(self, ast:LazyOp, fxn:Callable):
-    super().__init__()
-    self.fxn = fxn
-    info = get_lazyop_info(ast)
-    self.op_estimate, self.mem_estimate = info.flops, info.mem_estimate
-
-  def __call__(self, rawbufs:List[Buffer], var_vals:Dict[Variable, int], wait=False, jit=False) -> float:
-    st = time.perf_counter()
-    rawbufs[0]._buf = self.fxn([x._buf for x in rawbufs[1:]], var_vals)
-    et = time.perf_counter() - st
-    update_stats(f"<interpreted {rawbufs[0].size}>", self.op_estimate, self.mem_estimate, var_vals, et, len(rawbufs), jit, device=rawbufs[0].device)
-    return et
-
-class Interpreted:
-  def __init__(self, device:str, allocator: Allocator, fxn_for_op:Dict[Op, Callable]):
-    self.dname, self.allocator, self.fxn_for_op = device, allocator, fxn_for_op
-    self.synchronize, self.codegen, self.graph = lambda: None, None, None
-
-  @functools.lru_cache(None)    # pylint: disable=method-cache-max-size-none
-  def get_runner(self, ast:LazyOp) -> InterpretedASTRunner: return _get_interpreted_fxn(self.fxn_for_op, ast)
-
-def _get_interpreted_fxn(fxn_for_op:Dict[Op, Callable], ast:LazyOp) -> InterpretedASTRunner:
-  if DEBUG >= 3:
-    from tinygrad.graph import print_tree
-    print_tree(ast)
-  tglob: Dict[str, Any] = {"Variable": Variable}
-
-  @functools.lru_cache(None)
-  def gstr(x:Any, nm=None) -> str:
-    if ('Variable' in (str_arg := repr(x)) or 'NumNode' in str_arg):
-      str_arg = re.sub(r'Variable\(.*?\)', lambda m: f'var_vals[{str(m.group(0))}]', str_arg)
-      # TODO: (Variable - Variable) might create NumNode. can we remove it?
-      return re.sub(r'NumNode\((.*?)\)', r'\1', str_arg)
-    ret = str(nm).replace(".", "_") if nm else f"m{len(tglob):04d}"
-    tglob[ret] = x
-    return ret
-
-  lines: List[str] = []
-  @functools.lru_cache(None)
-  def _interpret_ast(ast:LazyOp) -> str:
-    # TODO: shortcutted store won't work with strides
-    if ast.op == BufferOps.STORE: return _interpret_ast(ast.src[0])
-    if TernaryOps.MULACC in fxn_for_op and ast.op == ReduceOps.SUM:
-      if ast.src[0].op == BinaryOps.MUL: ast = LazyOp(TernaryOps.MULACC, ast.src[0].src, ast.arg)
-      if (castop:=ast.src[0]).op == UnaryOps.CAST and (mulop:=castop.src[0]).op == BinaryOps.MUL:
-        # MULACC with acc cast rewrite: MUL -> CAST -> SUM => CAST -> MULACC
-        ast = LazyOp(TernaryOps.MULACC, tuple(LazyOp(UnaryOps.CAST, (s, ), castop.arg) for s in mulop.src), ast.arg)
-
-    if ast.op in BufferOps:
-      if ast.op == BufferOps.CONST: tmp = f"{gstr(fxn_for_op[ast.op], ast.op)}({gstr(ast.arg.val)}, {gstr(ast.arg.dtype)})"
-      else: tmp = f"{gstr(fxn_for_op[UnaryOps.CAST], UnaryOps.CAST)}(inputs[{ast.arg.idx-1}], ({gstr(ast.arg.dtype)}, True))"
-
-      # convert ShapeTracker to MovementOps
-      to_apply:List[Tuple[MovementOps, Tuple]] = []
-      for v in cast(ShapeTracker, ast.arg.st).views:
-        real_shape = tuple(y-x for x,y in v.mask) if v.mask else v.shape
-        real_offset = 0 if 0 in real_shape else (v.offset + (sum(x*st for (x,_),st in zip(v.mask, v.strides)) if v.mask else 0))
-        # first, we apply the offset
-        # then, we make it the correct shape
-        # then, we apply permutations
-        to_apply.append((MovementOps.AS_STRIDED, (tuple([s if st != 0 else 1 for s,st in zip(real_shape, v.strides)]), v.strides, real_offset)))
-        # then, we apply pre expand pads
-        if v.mask is not None:
-          pre_expand_pads = tuple((x,s-y) if st != 0 else (0,0) for (x,y),s,st in zip(v.mask, v.shape, v.strides))
-          post_expand_pads = tuple((x,s-y) if st == 0 else (0,0) for (x,y),s,st in zip(v.mask, v.shape, v.strides))
-          if any(x != (0,0) for x in pre_expand_pads):
-            to_apply.append((MovementOps.PAD, pre_expand_pads))
-            real_shape = tuple(x+s[0]+s[1] for x,s in zip(real_shape, pre_expand_pads))
-        # then, we do any expands
-        # NOTE: this is a good idea even without masks, since torch doesn't support negative strides and has to make a copy
-        if any(s != 1 and st == 0 for s,st in zip(real_shape, v.strides)): to_apply.append((MovementOps.EXPAND, real_shape))
-        # lastly, we apply post expand pads
-        if v.mask is not None and any(x != (0,0) for x in post_expand_pads): to_apply.append((MovementOps.PAD, post_expand_pads))
-
-      # apply those MovementOps
-      for mop,arg in to_apply: tmp = f"{gstr(fxn_for_op[mop], mop)}({tmp}, {gstr(arg)})"
-    else:
-      tmp = f"{gstr(fxn_for_op[ast.op], ast.op)}({', '.join([_interpret_ast(src) for src in ast.src] + ([gstr(ast.arg)] if ast.arg else []))})"
-
-    ret = f"a{len(lines)}"
-    lines.append(f"  {ret} = {tmp}")
-    return ret
-
-  ret = _interpret_ast(ast)
-  src = '\n'.join(['def run(inputs, var_vals):'] + lines + [f"  return {ret}"])
-  if DEBUG >= 4: print(functools.reduce(lambda x,y: (x.replace(y[0], str(y[1])) if y[0][0:2] == "m0" else x), tglob.items(), src))
-  exec(compile(src, "<ast>", "exec"), tglob) # pylint: disable=exec-used
-  return InterpretedASTRunner(ast, tglob['run'])
 
 # **************** for Compiled Devices ****************
 
+class CompileError(Exception): pass
+
 class Compiler:
-  linearizer_opts: ClassVar[LinearizerOptions]
-  def __init__(self, cachekey=None): self.cachekey = None if getenv("DISABLE_COMPILER_CACHE") else cachekey
-  def render(self, name:str, uops) -> str: raise NotImplementedError("need a render function")
+  def __init__(self, cachekey:Optional[str]=None): self.cachekey = None if getenv("DISABLE_COMPILER_CACHE") else cachekey
   def compile(self, src:str) -> bytes: raise NotImplementedError("need a compile function")
   def compile_cached(self, src:str) -> bytes:
-    if self.cachekey is not None: lib = diskcache_get(self.cachekey, src)
-    if lib is None:
+    if self.cachekey is None or (lib := diskcache_get(self.cachekey, src)) is None:
+      assert not getenv("ASSERT_COMPILE"), f"tried to compile with ASSERT_COMPILE set\n{src}"
       lib = self.compile(src)
       if self.cachekey is not None: diskcache_put(self.cachekey, src, lib)
     return lib
 
-class CompiledASTRunner(JITRunner):
-  def __init__(self, ast:Optional[LazyOp], name:str, prg:str, device:Compiled, global_size:Optional[List[int]]=None, local_size:Optional[List[int]]=None, precompiled:Optional[bytes]=None):  # noqa: E501
-    super().__init__()
-    if DEBUG >= 4: print(prg)
-    if global_size is not None: global_size = global_size + [1]*(3-len(global_size))
-    if local_size is not None: local_size = local_size + [1]*(3-len(local_size))
-    self.name, self.display_name, self.prg, self.device, self.global_size, self.local_size, self.first_run = \
-      to_function_name(name), name, prg, device, global_size, local_size, True
-    lib:bytes = precompiled if precompiled is not None else self.device.compiler.compile_cached(prg)
-    self.lib, self.clprg = lib, self.device.runtime(self.name, lib)
-    self.vars: List[Variable] = []
-    if ast:
-      info = get_lazyop_info(ast)
-      self.op_estimate, self.mem_estimate = info.flops, info.mem_estimate
-      self.vars = ast.vars()
-      assert all(v._val is None for v in self.vars), f"ASTRunner contains bound Variable {self.vars}"
-
-  def launch_dims(self, var_vals):
-    global_size = [sym_infer(sz, var_vals) for sz in self.global_size] if self.global_size is not None else self.global_size
-    local_size = [sym_infer(sz, var_vals) for sz in self.local_size] if self.local_size is not None else self.local_size
-    return global_size, local_size
-
-  def __call__(self, rawbufs:List[Buffer], var_vals:Dict[Variable, int], wait=False, jit=False, do_update_stats=True) -> Optional[float]:
-    global_size, local_size = self.launch_dims(var_vals)
-    if global_size is not None and local_size is None and all_int(self.global_size): # type: ignore[arg-type]
-      # TODO: this is copied from get_program
-      from tinygrad.features.search import optimize_local_size
-      local_size = self.local_size = optimize_local_size(self.clprg, global_size, rawbufs)
-      global_size = self.global_size = [g//l if g%l == 0 else g/l for g,l in zip(global_size, local_size)]
-    lra = {}
-    if global_size: lra['global_size'] = global_size
-    if local_size: lra['local_size'] = local_size
-    et = self.clprg(*[x._buf for x in rawbufs], **lra, vals=tuple(var_vals[k] for k in self.vars), wait=wait or DEBUG>=2)
-    if do_update_stats: update_stats(self.display_name, self.op_estimate, self.mem_estimate, var_vals, et, len(rawbufs), jit,
-                                     lra=lra, device=self.device.dname, first_run=self.first_run)
-    self.first_run = False
-    return et
-
 class Compiled:
-  def __init__(self, device:str, allocator:Allocator, compiler:Compiler, runtime, graph=None):
-    self.dname, self.allocator, self.compiler, self.runtime, self.graph = device, allocator, compiler, runtime, graph
-  def synchronize(self): pass  # override this in your device
+  def __init__(self, device:str, allocator:Allocator, renderer:Optional[Renderer], compiler:Optional[Compiler], runtime, graph=None):
+    self.dname, self.allocator, self.compiler, self.runtime, self.graph = device, allocator, compiler or Compiler(), runtime, graph
+    self.renderer = renderer or Renderer()
+  def synchronize(self):
+    """
+    Synchronize all pending operations on the device.
 
-  def to_program(self, k:Linearizer) -> CompiledASTRunner:
-    k.linearize()
-    return CompiledASTRunner(k.ast, k.name, self.compiler.render(to_function_name(k.name), k.uops), self, k.global_size, k.local_size)
+    This method ensures that all previously queued operations on the device have been completed before proceeding.
+    """
+    # override this in your device implementation
 
-  def get_linearizer(self, ast:LazyOp) -> Linearizer:
-    if DEBUG >= 3:
-      from tinygrad.graph import print_tree
-      print_tree(ast)
-    from tinygrad.codegen.linearizer import Linearizer
-    k = Linearizer(ast, self.compiler.linearizer_opts)
-    k.required_optimizations()
-    if not NOOPT:
-      if not (used_tensor_cores:=k.apply_tensor_cores(getenv("TC", 1))): k.hand_coded_optimizations()
-      if BEAM >= 1:
-        lins = [(("tc" if used_tensor_cores else "hc"), k)]
-        if used_tensor_cores:
-          lins.append(("hc", Linearizer(ast, self.compiler.linearizer_opts)))
-          lins[-1][1].hand_coded_optimizations()
-        kb = Linearizer(ast, self.compiler.linearizer_opts)
-        kb.required_optimizations()
-        from tinygrad.features.search import beam_search, time_linearizer, bufs_from_lin
-        test_rawbuffers = bufs_from_lin(kb)    # allocate scratch buffers for optimization
-        lins.append((f"beam{BEAM.value}", beam_search(kb, test_rawbuffers, BEAM.value, bool(getenv("BEAM_ESTIMATE", 1)))))
-        timed = sorted([(nm, tk, time_linearizer(tk, test_rawbuffers, allow_test_size=False, clear_l2=True)) for nm, tk in lins], key=lambda x: x[2])
-        if DEBUG >= 1: print("  <  ".join(f"{nm:6s} : {lin.colored_shape(30, dense=True)} : {tm*1e6:8.2f} us" for nm, lin, tm in timed))
-        k = timed[0][1]
-    return k
+# **************** for HCQ Compatible Devices ****************
 
-  @functools.lru_cache(None)    # pylint: disable=method-cache-max-size-none
-  def get_runner(self, ast:LazyOp) -> CompiledASTRunner: return self.to_program(self.get_linearizer(ast))
+def hcq_command(func):
+  """
+  Decorator for HWCommandQueue commands. Enables command indexing and stores metadata for command updates.
+
+  For example:
+    ```python
+      @hcq_command
+      def command_method(self, ...): ...
+    ```
+  """
+  def __wrapper(self, *args, **kwargs):
+    self.cmds_offset.append(len(self.q))
+    func(self, *args, **kwargs)
+    self.cmds_len.append(len(self.q) - self.cmds_offset[-1])
+    self.cmds_meta.append(func.__name__)
+    return self
+  return __wrapper
+
+class HWCommandQueue:
+  """
+  A base class for hardware command queues in the HCQ (Hardware Command Queue) API.
+  Both compute and copy queues should have the following commands implemented.
+  """
+
+  def __init__(self): self.q, self.binded_device, self.cmds_offset, self.cmds_len, self.cmds_meta = [], None, [], [], []
+  def __len__(self): return len(self.cmds_offset)
+  def _patch(self, cmd_idx, offset, data): self.q[(st:=self.cmds_offset[cmd_idx]+offset):st+len(data)] = array.array('I', data)
+
+  @hcq_command
+  def signal(self, signal:HCQSignal, value:int):
+    """
+    Enqueues a signal command which sets the signal to the given value, ensuring all previous operations are completed.
+
+    Args:
+      signal: The signal to set
+      value: The value to set the signal to
+    """
+    self._signal(signal, value)
+  def _signal(self, signal:HCQSignal, value:int): raise NotImplementedError("backend should overload this function")
+
+  @hcq_command
+  def wait(self, signal:HCQSignal, value:int):
+    """
+    Enqueues a wait command which halts execution until the signal is greater than or equal to a specific value.
+
+    Args:
+      signal: The signal to wait on
+      value: The value to wait for
+    """
+    self._wait(signal, value)
+  def _wait(self, signal, value): raise NotImplementedError("backend should overload this function")
+
+  @hcq_command
+  def timestamp(self, signal:HCQSignal):
+    """
+    Enqueues a timestamp command which records the current time in a signal after all previously enqueued commands are completed.
+
+    Args:
+      signal: The signal to store the timestamp
+    """
+    self._timestamp(signal)
+  def _timestamp(self, signal): raise NotImplementedError("backend should overload this function")
+
+  def update_signal(self, cmd_idx:int, signal:Optional[Any]=None, value:Optional[int]=None):
+    """
+    Updates a previously queued signal command.
+
+    Args:
+      cmd_idx: Index of the signal command to update
+      signal: New signal to set (if None, keeps the original)
+      value: New value to set (if None, keeps the original)
+    """
+    if self.cmds_meta[cmd_idx] != "signal": raise RuntimeError("called update_signal not on a signal command")
+    self._update_signal(cmd_idx, signal, value)
+    return self
+  def _update_signal(self, cmd_idx:int, signal:Optional[Any], value:Optional[int]): raise NotImplementedError("backend should overload this function")
+
+  def update_wait(self, cmd_idx:int, signal:Optional[Any]=None, value:Optional[int]=None):
+    """
+    Updates a previously queued wait command.
+
+    Args:
+      cmd_idx: Index of the wait command to update
+      signal: New signal to wait on (if None, keeps the original)
+      value: New value to wait for (if None, keeps the original)
+    """
+    if self.cmds_meta[cmd_idx] != "wait": raise RuntimeError("called update_wait not on a wait command")
+    self._update_wait(cmd_idx, signal, value)
+    return self
+  def _update_wait(self, cmd_idx:int, signal:Optional[Any], value:Optional[int]): raise NotImplementedError("backend should overload this function")
+
+  def submit(self, device:HCQCompiled):
+    """
+    Submits the command queue to a specific device for execution.
+
+    Args:
+      device: The device to submit the queue to
+    """
+    self._submit(device)
+    return self
+  def _submit(self, device:HCQCompiled): raise NotImplementedError("backend should overload this function")
+
+class HWComputeQueue(HWCommandQueue):
+  @hcq_command
+  def memory_barrier(self):
+    """
+    Enqueues a memory barrier command to ensure memory coherence between agents.
+    """
+    self._memory_barrier()
+  def _memory_barrier(self): pass
+
+  @hcq_command
+  def exec(self, prg:HCQProgram, kernargs:int, global_size:Tuple[int,int,int], local_size:Tuple[int,int,int]):
+    """
+    Enqueues an execution command for a kernel program.
+
+    Args:
+      prg: The program to execute
+      kernargs: The pointer to kernel arguments
+      global_size: The global work size
+      local_size: The local work size
+    """
+    self._exec(prg, kernargs, global_size, local_size)
+  def _exec(self, prg, kernargs, global_size, local_size): raise NotImplementedError("backend should overload this function")
+
+  def update_exec(self, cmd_idx:int, global_size:Tuple[int,int,int], local_size:Tuple[int,int,int]):
+    """
+    Updates a previously queued execution command.
+
+    Args:
+      cmd_idx: Index of the execution command to update
+      global_size: New global work size
+      local_size: New local work size
+    """
+    if self.cmds_meta[cmd_idx] != "exec": raise RuntimeError("called update_exec not on an exec command")
+    self._update_exec(cmd_idx, global_size, local_size)
+    return self
+  def _update_exec(self, cmd_idx, global_size, local_size): raise NotImplementedError("backend should overload this function")
+
+class HWCopyQueue(HWCommandQueue):
+  @hcq_command
+  def copy(self, dest:HCQBuffer, src:HCQBuffer, copy_size:int):
+    """
+    Enqueues a copy command to transfer data.
+
+    Args:
+      dest: The destination of the copy
+      src: The source of the copy
+      copy_size: The size of data to copy
+    """
+    self._copy(dest, src, copy_size)
+  def _copy(self, dest:HCQBuffer, src:HCQBuffer, copy_size:int): raise NotImplementedError("backend should overload this function")
+
+  def update_copy(self, cmd_idx:int, dest:Optional[HCQBuffer]=None, src:Optional[HCQBuffer]=None):
+    """
+    Updates a previously queued copy command.
+
+    Args:
+      cmd_idx: Index of the copy command to update
+      dest: New destination of the copy (if None, keeps the original)
+      src: New source of the copy (if None, keeps the original)
+    """
+    if self.cmds_meta[cmd_idx] != "copy": raise RuntimeError("called update_copy not on an copy command")
+    self._update_copy(cmd_idx, dest, src)
+    return self
+  def _update_copy(self, cmd_idx, dest, src): raise NotImplementedError("backend should overload this function")
+
+class HCQSignal:
+  @property
+  def value(self) -> int: return self._get_value()
+
+  @value.setter
+  def value(self, new_value:int): self._set_value(new_value)
+
+  def _get_value(self) -> int: raise NotImplementedError("_get_value() method must be implemented")
+  def _set_value(self, new_value:int): raise NotImplementedError("_set_value() method must be implemented")
+
+  @property
+  def timestamp(self) -> float:
+    """
+    Get the timestamp field of the signal.
+
+    This property provides read-only access to the signal's timestamp.
+
+    Returns:
+      The timestamp in microseconds.
+    """
+    return self._get_timestamp()
+  def _get_timestamp(self) -> float: raise NotImplementedError("_get_timestamp() method must be implemented")
+
+  def wait(self, value:int, timeout:int=10000):
+    """
+    Waits the signal is greater than or equal to a specific value.
+
+    Args:
+      value: The value to wait for.
+      timeout: Maximum time to wait in milliseconds. Defaults to 10s.
+    """
+    raise NotImplementedError("wait() method must be implemented")
+
+@contextlib.contextmanager
+def hcq_profile(dev, enabled, desc, queue_type=None, queue=None):
+  st, en = (dev.signal_t(), dev.signal_t()) if enabled else (None, None)
+
+  if enabled and queue is not None: queue.timestamp(st)
+  elif enabled: queue_type().timestamp(st).submit(dev)
+
+  try: yield (st, en)
+  finally:
+    if enabled and queue is not None: queue.timestamp(en)
+    elif enabled: queue_type().timestamp(en).submit(dev)
+
+    if enabled and PROFILE: dev.sig_prof_records.append((st, en, desc, queue_type is dev.hw_copy_queue_t))
+
+class HCQProgram:
+  def __init__(self, kernargs_alloc_size:int, kernargs_args_offset:int=0):
+    self.kernargs_alloc_size, self.kernargs_args_offset = kernargs_alloc_size, kernargs_args_offset
+  def fill_kernargs(self, kernargs_ptr:int, bufs:Tuple[Any, ...], vals:Tuple[int, ...]=()): raise NotImplementedError("need fill_kernargs")
+
+class HCQCompiled(Compiled):
+  """
+  A base class for devices compatible with the HCQ (Hardware Command Queue) API.
+  """
+
+  def __init__(self, device:str, allocator:Allocator, renderer:Renderer, compiler:Compiler, runtime, signal_t:Type[HCQSignal],
+               comp_queue_t:Type[HWComputeQueue], copy_queue_t:Type[HWCopyQueue], timeline_signals:Tuple[HCQSignal, HCQSignal]):
+    self.signal_t, self.hw_compute_queue_t, self.hw_copy_queue_t = signal_t, comp_queue_t, copy_queue_t
+    self.timeline_value:int = 1
+    self.timeline_signal, self._shadow_timeline_signal = timeline_signals
+    self.sig_prof_records:List[Tuple[HCQSignal, HCQSignal, str, bool]] = []
+    self.raw_prof_records:List[Tuple[float, float, str, bool]] = []
+    if PROFILE: self._prof_setup()
+
+    from tinygrad.runtime.graph.hcq import HCQGraph
+    super().__init__(device, allocator, renderer, compiler, runtime, HCQGraph)
+
+  def _gpu2cpu_time(self, gpu_time:float, is_copy:bool) -> float:
+    """
+    Translates local gpu time (timestamp) into global cpu time.
+    """
+    return gpu_time + (self.gpu2cpu_copy_time_diff if is_copy else self.gpu2cpu_compute_time_diff)
+
+  def _prof_setup(self):
+    if not hasattr(self, 'profile_logger'): atexit.register(self._prof_finalize)
+    self.profile_logger = ProfileLogger()
+
+    def _sync_queue(q_t):
+      q_t().timestamp(self.timeline_signal).signal(self.timeline_signal, self.timeline_value).submit(self)
+      self.timeline_value += 1
+      cpu_start_time = time.perf_counter_ns() / 1e3
+      self.timeline_signal.wait(self.timeline_value - 1)
+      return cpu_start_time - self.timeline_signal.timestamp
+    self.gpu2cpu_compute_time_diff, self.gpu2cpu_copy_time_diff = _sync_queue(self.hw_compute_queue_t), _sync_queue(self.hw_copy_queue_t)
+
+  def _prof_process_events(self):
+    self.raw_prof_records += [(st.timestamp, en.timestamp, name, is_cp) for st, en, name, is_cp in self.sig_prof_records]
+    self.sig_prof_records = []
+
+  def _prof_finalize(self):
+    for st, en, name, is_cp in self.raw_prof_records:
+      self.profile_logger.events += [(name, self._gpu2cpu_time(st, is_cp), self._gpu2cpu_time(en, is_cp), self.dname, ["COMPUTE", "DMA"][is_cp])]
+    del self.profile_logger
+
+  def _wrap_timeline_signal(self):
+    self.timeline_signal, self._shadow_timeline_signal, self.timeline_value = self._shadow_timeline_signal, self.timeline_signal, 1
+    self.timeline_signal.value = 0
+    cast(HCQAllocator, self.allocator).b_timeline = [0] * len(cast(HCQAllocator, self.allocator).b)
+
+# Protocol for hcq compatible allocators for allocated buffers to contain VA address and it's size.
+class HCQBuffer(Protocol): va_addr:int; size:int # noqa: E702
+
+class HCQAllocator(LRUAllocator): # pylint: disable=abstract-method
+  """
+  A base allocator class compatible with the HCQ (Hardware Command Queue) API.
+
+  This class implements basic copy operations following the HCQ API, utilizing both `HWComputeQueue` and `HWCopyQueue`.
+  """
+
+  def __init__(self, device:HCQCompiled, batch_size:int=(2 << 20), batch_cnt:int=32):
+    self.device:Any = device
+    self.b = [self._alloc(batch_size, BufferOptions(host=True)) for _ in range(batch_cnt)]
+    self.b_timeline, self.b_next = [0] * len(self.b), 0
+    super().__init__()
+
+  def _alloc(self, size:int, options:BufferOptions) -> HCQBuffer: raise NotImplementedError("need hcq compat alloc")
+
+  def copyin(self, dest:HCQBuffer, src:memoryview):
+    with hcq_profile(self.device, queue_type=self.device.hw_copy_queue_t, desc=f"CPU -> {self.device.dname}", enabled=PROFILE):
+      for i in range(0, src.nbytes, self.b[0].size):
+        self.b_next = (self.b_next + 1) % len(self.b)
+        self.device.timeline_signal.wait(self.b_timeline[self.b_next])
+        ctypes.memmove(self.b[self.b_next].va_addr, from_mv(src[i:]), lsize:=min(self.b[self.b_next].size, src.nbytes-i))
+        self.device.hw_copy_queue_t().wait(self.device.timeline_signal, self.device.timeline_value - 1) \
+                                     .copy(dest.va_addr+i, self.b[self.b_next].va_addr, lsize) \
+                                     .signal(self.device.timeline_signal, self.device.timeline_value).submit(self.device)
+        self.b_timeline[self.b_next] = self.device.timeline_value
+        self.device.timeline_value += 1
+
+  def copy_from_disk(self, dest:HCQBuffer, src, size):
+    def _get_temp_buf():
+      # Check if the next buffer is safe to be used (its signal has passed) and reserve it.
+      if self.b_timeline[(self.b_next + 1) % len(self.b)] <= self.device.timeline_signal.value:
+        self.b_timeline[(self.b_next + 1) % len(self.b)], self.b_next = (1 << 64), (self.b_next + 1) % len(self.b)
+        return (self.b[self.b_next].va_addr, self.b_next)
+      return None
+
+    with hcq_profile(self.device, queue_type=self.device.hw_copy_queue_t, desc=f"DISK -> {self.device.dname}", enabled=PROFILE):
+      for (batch_info, dst_off, src_off, copy_size) in src.device.allocator._copyout_sharded(src, size, _get_temp_buf, seg_len=self.b[0].size):
+        self.device.hw_copy_queue_t().wait(self.device.timeline_signal, self.device.timeline_value - 1) \
+                                     .copy(dest.va_addr + dst_off, batch_info[0] + src_off, copy_size) \
+                                     .signal(self.device.timeline_signal, self.device.timeline_value).submit(self.device)
+        self.b_timeline[batch_info[1]] = self.device.timeline_value
+        self.device.timeline_value += 1
+
+  def copyout(self, dest:memoryview, src:HCQBuffer):
+    self.device.synchronize()
+
+    with hcq_profile(self.device, queue_type=self.device.hw_copy_queue_t, desc=f"{self.device.dname} -> CPU", enabled=PROFILE):
+      for i in range(0, dest.nbytes, self.b[0].size):
+        self.device.hw_copy_queue_t().wait(self.device.timeline_signal, self.device.timeline_value - 1) \
+                                     .copy(self.b[0].va_addr, src.va_addr+i, lsize:=min(self.b[0].size, dest.nbytes-i)) \
+                                     .signal(self.device.timeline_signal, self.device.timeline_value).submit(self.device)
+        self.device.timeline_signal.wait(self.device.timeline_value)
+        self.device.timeline_value += 1
+
+        ctypes.memmove(from_mv(dest[i:]), self.b[0].va_addr, lsize)
+
+  def transfer(self, dest:HCQBuffer, src:HCQBuffer, sz:int, src_dev, dest_dev):
+    src_dev._gpu_map(dest)
+
+    with hcq_profile(self.device, queue_type=self.device.hw_copy_queue_t, desc=f"{src_dev.dname} -> {dest_dev.dname}", enabled=PROFILE):
+      src_dev.hw_copy_queue_t().wait(src_dev.timeline_signal, src_dev.timeline_value - 1) \
+                               .wait(dest_dev.timeline_signal, dest_dev.timeline_value - 1) \
+                               .copy(dest.va_addr, src.va_addr, sz) \
+                               .signal(src_dev.timeline_signal, src_dev.timeline_value).submit(src_dev)
+      src_dev.timeline_value += 1
+
+    if src_dev != dest_dev:
+      dest_dev.hw_compute_queue_t().wait(src_dev.timeline_signal, src_dev.timeline_value - 1) \
+                                   .wait(dest_dev.timeline_signal, dest_dev.timeline_value - 1) \
+                                   .signal(dest_dev.timeline_signal, dest_dev.timeline_value).submit(dest_dev)
+      dest_dev.timeline_value += 1
+
+  def offset(self, buf, size:int, offset:int) -> HCQBuffer:
+    return type(buf)(va_addr=buf.va_addr + offset, size=size, **{k:v for k,v in buf.__dict__.items() if k not in ['va_addr', 'size']},
+                     **{x[0]:getattr(buf, x[0]) for x in getattr(buf, '_fields_', []) if x[0] not in ['va_addr', 'size']}, _base=buf)

@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 from typing import Optional, Union
 import argparse
-from tqdm import trange
 import numpy as np
 import tiktoken
-from tinygrad import Tensor, TinyJit, Device, GlobalCounters
-from tinygrad.helpers import Timing, DEBUG, getenv, fetch, colored
+from tinygrad import Tensor, TinyJit, Device, GlobalCounters, Variable
+from tinygrad.helpers import Timing, DEBUG, JIT, getenv, fetch, colored, trange
 from tinygrad.nn import Embedding, Linear, LayerNorm
 from tinygrad.nn.state import torch_load, load_state_dict, get_state_dict
-from tinygrad.shape.symbolic import Variable
 
 MAX_CONTEXT = getenv("MAX_CONTEXT", 128)
 HALF = getenv("HALF")
@@ -33,18 +31,17 @@ class Attention:
 
     # create kv cache
     if not hasattr(self, "cache_kv"):
-      self.cache_kv = Tensor.zeros(2, bsz, MAX_CONTEXT, self.n_heads, self.head_dim, dtype=x.dtype)
+      self.cache_kv = Tensor.zeros(2, bsz, MAX_CONTEXT, self.n_heads, self.head_dim, dtype=x.dtype).contiguous().realize()
+
+    # update the cache
+    self.cache_kv.shrink((None, None,(start_pos,start_pos+seqlen),None,None)).assign(Tensor.stack(xk, xv)).realize()
 
     if start_pos > 0:
-      keys = self.cache_kv[0].shrink((None, (0, start_pos), None, None)).cat(xk, dim=1)
-      values = self.cache_kv[1].shrink((None, (0, start_pos), None, None)).cat(xv, dim=1)
+      keys = self.cache_kv[0].shrink((None, (0, start_pos+seqlen), None, None))
+      values = self.cache_kv[1].shrink((None, (0, start_pos+seqlen), None, None))
     else:
       keys = xk
       values = xv
-
-    # update the cache
-    new_cache = Tensor.stack([keys, values]).pad((None, None,(0,MAX_CONTEXT-start_pos-seqlen),None,None)).contiguous()
-    self.cache_kv.assign(new_cache).realize()
 
     xq, keys, values = xq.transpose(1, 2), keys.transpose(1, 2), values.transpose(1, 2)
     return self.c_proj(xq.scaled_dot_product_attention(keys, values, mask).transpose(1, 2).reshape(bsz, seqlen, self.dim))
@@ -111,7 +108,7 @@ class Transformer:
     return ret.flatten().realize()
 
   def __call__(self, tokens:Tensor, start_pos:Variable, temperature:float=0.0) -> Tensor:
-    forward = (self.forward_jit if (isinstance(tokens, Variable) or tokens.shape[1] == 1) and getenv("JIT") else self.forward)
+    forward = (self.forward_jit if JIT and (isinstance(tokens, Variable) or tokens.shape[1] == 1) else self.forward)
     return forward(tokens, start_pos, temperature)
 
 VOCAB_SIZE = 50257
@@ -141,7 +138,7 @@ class GPT2:
 
     if HALF:
       for l in get_state_dict(model).values():
-        l.assign(l.half().realize())
+        l.replace(l.half().realize())
 
     return GPT2(model, tokenizer)
 
