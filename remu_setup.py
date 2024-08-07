@@ -9,6 +9,7 @@ from tinygrad.device import Device
 # clone remu and run cargo build --release, change RHIP_PATH
 os.environ["RHIP_PATH"] = "/Users/qazal/code/remu"
 os.environ["RHIP"] = "1"
+os.environ["0SX"] = "1"
 
 # DEBUG=1 prints instructions, green is an active thread, gray is inactive thread.
 os.environ["DEBUG"] = "1"
