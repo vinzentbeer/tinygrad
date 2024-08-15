@@ -102,8 +102,11 @@ class TestUOps(unittest.TestCase):
 
 class TestFloatUOps(TestUOps):
   def test_neg(self): self._test_uop_fxn(UnaryOps.NEG, lambda a: -a)
+  @unittest.skipIf(Device.DEFAULT == "CLANG", 'not supported as uop')
   def test_exp2(self): self._test_uop_fxn(UnaryOps.EXP2, lambda a: np.exp2(a))
+  @unittest.skipIf(Device.DEFAULT == "CLANG", 'not supported as uop')
   def test_log2(self): self._test_uop_fxn(UnaryOps.LOG2, lambda a: math.log2(a) if a > 0 else float('-inf' if a==0 else 'nan'))
+  @unittest.skipIf(Device.DEFAULT == "CLANG", 'not supported as uop')
   def test_sin(self): self._test_uop_fxn(UnaryOps.SIN, lambda a: math.sin(a))
   def test_recip(self): self._test_uop_fxn(UnaryOps.RECIP, lambda a: 1/a if a != 0 else float('inf'))
   def test_sqrt(self): self._test_uop_fxn(UnaryOps.SQRT, lambda a: math.sqrt(a) if a >= 0 else float('nan'))
@@ -371,6 +374,45 @@ class TestUOpStr(TestEqUOps):
   def test_nop_str(self):
     a = NOp(UOps.CONST, dtypes.float, (), 2.0, name="c0") + NOp(UOps.CONST, dtypes.float, (), 3.0, name="c1")
     assert str(eval(str(a))) == str(a)
+
+class TestIndexingOrdering(unittest.TestCase):
+  # NOTE: these tests skip type_verify since they add dtype to STORE
+  @unittest.expectedFailure
+  def test_simple_order(self):
+    buf = UOp(UOps.DEFINE_GLOBAL, PtrDType(dtypes.float), (), 0)
+    st0 = UOp(UOps.STORE, dtypes.float.vec(4), (buf, UOp.const(dtypes.int, 0), UOp.const(dtypes.float.vec(4), 42)))
+    st1 = UOp(UOps.STORE, dtypes.float, (buf, UOp.const(dtypes.int, 4), UOp.const(dtypes.float, 10)))
+    uops = UOpGraph([st1, st0]).linearize(skip_check=True)
+    stores = [st for st in uops.uops if st.op is UOps.STORE]
+    assert stores[0].src[1] < stores[1].src[1], f"stored at idx {stores[1].src[1].arg} AFTER {stores[0].src[1].arg}"
+
+  @unittest.expectedFailure
+  def test_ordering_multi_output(self):
+    buf0 = UOp(UOps.DEFINE_GLOBAL, PtrDType(dtypes.float), (), 0)
+    buf1 = UOp(UOps.DEFINE_GLOBAL, PtrDType(dtypes.float), (), 1)
+    st0_0 = UOp(UOps.STORE, dtypes.float.vec(4), (buf0, UOp.const(dtypes.int, 0), UOp.const(dtypes.float.vec(4), 42)))
+    st1_0 = UOp(UOps.STORE, dtypes.float, (buf0, UOp.const(dtypes.int, 4), UOp.const(dtypes.float, 10)))
+    st0_1 = UOp(UOps.STORE, dtypes.float.vec(4), (buf1, UOp.const(dtypes.int, 0), UOp.const(dtypes.float.vec(4), 42)))
+    st1_1 = UOp(UOps.STORE, dtypes.float, (buf1, UOp.const(dtypes.int, 4), UOp.const(dtypes.float, 10)))
+    uops = UOpGraph([st0_0, st1_0, st0_1, st1_1]).linearize(skip_check=True)
+    stores = [st for st in uops.uops if st.op is UOps.STORE]
+    print("\n".join(map(str, stores)))
+    # buf0 stores come first
+    self.assertEqual(stores[0].src[0].arg, stores[1].src[0].arg)
+    # buf1 stores come next
+    self.assertEqual(stores[2].src[0].arg, stores[3].src[0].arg)
+    # both stores are aligned based on idx
+    assert stores[0].src[1] < stores[1].src[1], f"stored at idx {stores[1].src[1].arg} AFTER {stores[0].src[1].arg}"
+    assert stores[2].src[1] < stores[3].src[1], f"stored at idx {stores[1].src[1].arg} AFTER {stores[0].src[1].arg}"
+
+  def test_simple_order_with_special(self):
+    buf = UOp(UOps.DEFINE_GLOBAL, PtrDType(dtypes.float), (), 0)
+    gidx0 = UOp(UOps.SPECIAL, dtypes.int, (), ('gidx0', 4))
+    st0 = UOp(UOps.STORE, dtypes.float.vec(4), (buf, gidx0+UOp.const(dtypes.int, 0), UOp.const(dtypes.float.vec(4), 42)))
+    st1 = UOp(UOps.STORE, dtypes.float, (buf, UOp.const(dtypes.int, 4), UOp.const(dtypes.float, 10)))
+    uops = UOpGraph([st1, st0]).linearize(skip_check=True)
+    stores = [st for st in uops.uops if st.op is UOps.STORE]
+    assert stores[0].src[1] < stores[1].src[1], f"stored at idx {stores[1].src[1].arg} AFTER {stores[0].src[1].arg}"
 
 if __name__ == '__main__':
   unittest.main(verbosity=2)
