@@ -1,7 +1,7 @@
 import ctypes, os
 from tinygrad.device import Compiled, Compiler, MallocAllocator
 from tinygrad.renderer.cstyle import HIPRenderer
-from tinygrad.runtime.support.hip_comgr import compile_hip
+from tinygrad.runtime.support.compiler_hip import compile_hip
 
 rhip = ctypes.CDLL(os.getenv("RHIP_PATH", "")+"/target/release/libremu.dylib")
 class AMDCompiler(Compiler):
