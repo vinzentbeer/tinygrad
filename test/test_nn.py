@@ -3,8 +3,8 @@ import unittest
 import numpy as np
 import torch
 from tinygrad import Tensor, Device, TinyJit
+from tinygrad.ops import UOps
 from tinygrad.helpers import CI, Context
-from tinygrad.ops import MetaOps
 from tinygrad.nn import Conv1d, ConvTranspose1d, Conv2d, ConvTranspose2d, Linear, Embedding
 from tinygrad.nn import BatchNorm, LayerNorm, LayerNorm2d, GroupNorm, InstanceNorm, RMSNorm, LSTMCell
 from tinygrad.nn.state import load_state_dict
@@ -16,43 +16,56 @@ class TestNN(unittest.TestCase):
   @unittest.skipIf(Device.DEFAULT == "WEBGPU", "no int64 on WebGPU")
   def test_sparse_cat_cross_entropy(self):
     # create in tinygrad
-    input_tensor = Tensor.randn(5, 5)
-    target = Tensor([0, 0, 0, 1, 2])  # torch doesn't support target=-1
+    input_tensor = Tensor.randn(6, 5) # not square to test that mean scaling uses the correct dimension
+    target = Tensor([0, 0, 0, 1, 2, 3])  # torch doesn't support target=-1
     torch_input = torch.tensor(input_tensor.numpy())
     torch_target = torch.tensor(target.numpy(), dtype=torch.long)
 
     for smoothing in [0.0, 0.1, 0.5, 1.0]:
       for ignore_index in [-1, 0, 2]:
-        loss = input_tensor.sparse_categorical_crossentropy(target, label_smoothing=smoothing, ignore_index=ignore_index)
-        torch_loss = torch.nn.CrossEntropyLoss(reduction='mean', label_smoothing=smoothing, ignore_index=ignore_index)(torch_input, torch_target)
-        np.testing.assert_allclose(loss.numpy(), torch_loss.detach().numpy(), atol=1e-5, rtol=1e-6)
+        for reduction in ["none", "sum", "mean"]:
+          loss = input_tensor.sparse_categorical_crossentropy(target, label_smoothing=smoothing, ignore_index=ignore_index, reduction=reduction)
+          torch_loss = torch.nn.CrossEntropyLoss(reduction=reduction, label_smoothing=smoothing, ignore_index=ignore_index)(torch_input, torch_target)
+          np.testing.assert_allclose(loss.numpy(), torch_loss.detach().numpy(), atol=1e-5, rtol=1e-6)
 
-  def test_batchnorm2d(self, training=False, threed=False):
+          # also test with a batch dimension (of size 1)
+          loss = input_tensor.unsqueeze(0).sparse_categorical_crossentropy(
+            target.unsqueeze(0), label_smoothing=smoothing, ignore_index=ignore_index, reduction=reduction
+          )
+          torch_loss = torch.nn.CrossEntropyLoss(reduction=reduction, label_smoothing=smoothing, ignore_index=ignore_index)(
+            torch_input.unsqueeze(0).permute(0,2,1), torch_target.unsqueeze(0)
+          )
+          np.testing.assert_allclose(loss.numpy(), torch_loss.detach().numpy(), atol=1e-5, rtol=1e-6)
+
+  def test_batchnorm2d(self, training=False, threed=False, track_running_stats=True):
     with Tensor.train(training):
       szs = [4, 8, 16, 32]
       for sz in szs:
         # create in tinygrad
-        bn = BatchNorm(sz, eps=1e-5, track_running_stats=training)
+        bn = BatchNorm(sz, eps=1e-5, track_running_stats=track_running_stats)
         bn.weight = Tensor.randn(sz)
         bn.bias = Tensor.randn(sz)
-        bn.running_mean = Tensor.randn(sz)
-        bn.running_var = Tensor.randn(sz)
-        bn.running_var.numpy()[bn.running_var.numpy() < 0] = 0
+        if track_running_stats:
+          bn.running_mean = Tensor.randn(sz)
+          bn.running_var = Tensor.randn(sz)
+          bn.running_var.numpy()[bn.running_var.numpy() < 0] = 0
 
         # create in torch
         with torch.no_grad():
           if threed:
-            tbn = torch.nn.BatchNorm3d(sz).eval()
+            tbn = torch.nn.BatchNorm3d(sz, track_running_stats=track_running_stats).eval()
           else:
-            tbn = torch.nn.BatchNorm2d(sz).eval()
+            tbn = torch.nn.BatchNorm2d(sz, track_running_stats=track_running_stats).eval()
           tbn.training = training
           tbn.weight[:] = torch.tensor(bn.weight.numpy())
           tbn.bias[:] = torch.tensor(bn.bias.numpy())
-          tbn.running_mean[:] = torch.tensor(bn.running_mean.numpy())
-          tbn.running_var[:] = torch.tensor(bn.running_var.numpy())
+          if track_running_stats:
+            tbn.running_mean[:] = torch.tensor(bn.running_mean.numpy())
+            tbn.running_var[:] = torch.tensor(bn.running_var.numpy())
 
-        np.testing.assert_allclose(bn.running_mean.numpy(), tbn.running_mean.detach().numpy(), rtol=1e-5, atol=1e-6)
-        np.testing.assert_allclose(bn.running_var.numpy(), tbn.running_var.detach().numpy(), rtol=1e-5, atol=1e-6)
+        if track_running_stats:
+          np.testing.assert_allclose(bn.running_mean.numpy(), tbn.running_mean.detach().numpy(), rtol=1e-5, atol=1e-6)
+          np.testing.assert_allclose(bn.running_var.numpy(), tbn.running_var.detach().numpy(), rtol=1e-5, atol=1e-6)
 
         # trial
         if threed:
@@ -68,14 +81,17 @@ class TestNN(unittest.TestCase):
 
         # close
         np.testing.assert_allclose(outt.numpy(), toutt.detach().numpy(), rtol=5e-4, atol=1e-6)
-        np.testing.assert_allclose(bn.running_mean.numpy(), tbn.running_mean.detach().numpy(), rtol=1e-5, atol=1e-6)
-        np.testing.assert_allclose(bn.running_var.numpy(), tbn.running_var.detach().numpy(), rtol=1e-5, atol=1e-6)
+        if track_running_stats:
+          np.testing.assert_allclose(bn.running_mean.numpy(), tbn.running_mean.detach().numpy(), rtol=1e-5, atol=1e-6)
+          np.testing.assert_allclose(bn.running_var.numpy(), tbn.running_var.detach().numpy(), rtol=1e-5, atol=1e-6)
 
-  def test_batchnorm2d_training(self):
-    self.test_batchnorm2d(True)
-
-  def test_batchnorm3d(self): self.test_batchnorm2d(False, True)
-  def test_batchnorm3d_training(self): self.test_batchnorm2d(True, True)
+  def test_batchnorm2d_training(self): self.test_batchnorm2d(True, False, True)
+  def test_batchnorm2d_no_running_stats(self): self.test_batchnorm2d(False, False, False)
+  def test_batchnorm2d_training_no_running_stats(self): self.test_batchnorm2d(True, False, False)
+  def test_batchnorm3d(self): self.test_batchnorm2d(False, True, True)
+  def test_batchnorm3d_training(self): self.test_batchnorm2d(True, True, True)
+  def test_batchnorm3d_no_running_stats(self): self.test_batchnorm2d(False, True, False)
+  def test_batchnorm3d_training_no_running_stats(self): self.test_batchnorm2d(True, True, False)
 
   def test_batchnorm_axis(self):
     sz = (2, 4, 3, 2, 2)
@@ -440,7 +456,7 @@ class TestNN(unittest.TestCase):
                 [12, 19, 8, 1]])
     result = layer(a)
     schedule = create_schedule([result.lazydata])
-    self.assertEqual(3, len([item for item in schedule if item.ast.op is MetaOps.KERNEL]), "first run realizes arange, weight, and embedding")
+    self.assertEqual(3, len([item for item in schedule if item.ast.op is UOps.SINK]), "first run realizes arange, weight, and embedding")
     run_schedule(schedule)
 
     b = Tensor([[1, 2, 3],
@@ -448,7 +464,7 @@ class TestNN(unittest.TestCase):
                 [7, 8, 9]])
     result = layer(b)
     schedule = create_schedule([result.lazydata])
-    self.assertEqual(1, len([item for item in schedule if item.ast.op is MetaOps.KERNEL]), "second run realizes embedding only")
+    self.assertEqual(1, len([item for item in schedule if item.ast.op is UOps.SINK]), "second run realizes embedding only")
     run_schedule(schedule)
 
   def test_load_state_dict(self):

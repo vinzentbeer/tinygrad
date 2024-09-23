@@ -1,17 +1,29 @@
 import unittest, itertools
-from test.helpers import TestUOps
 from tinygrad.dtype import dtypes
-from tinygrad.ops import BinaryOps, TernaryOps, ReduceOps, UnaryOps # noqa: F401
-from tinygrad.codegen.uops import UOps, UOp, PatternMatcher, UPat
-from tinygrad.codegen.uopgraph import constant_folder
+from tinygrad.ops import UOps, UOp, BinaryOps, TernaryOps, ReduceOps, UnaryOps # noqa: F401
+from tinygrad.ops import PatternMatcher, UPat
 
-class TestPatternMatcher(TestUOps):
+class TestPatternMatcher(unittest.TestCase):
   def test_simple_match(self):
     matcher = PatternMatcher([(UPat(UOps.CONST, name="x", dtype=dtypes.float), lambda x: x)])
     c1 = UOp(UOps.CONST, dtypes.float, arg=1.0)
     c2 = UOp(UOps.CONST, dtypes.int, arg=1)
     self.assertEqual(matcher.rewrite(c1), c1)
     self.assertEqual(matcher.rewrite(c2), None)
+
+  def test_match_sz_0(self):
+    match_cnt = 0
+    def fxn(x):
+      nonlocal match_cnt
+      match_cnt += 1
+      assert len(x.src) == 0
+      return UOp(UOps.CONST, src=(UOp(UOps.CONST),))
+    matcher = PatternMatcher([(UPat(UOps.CONST, src=(), name="x"), fxn)])
+    c1 = UOp(UOps.CONST, dtypes.float, arg=1.0)
+    # second rewrite shouldn't match anything
+    c1 = matcher.rewrite(c1)
+    c1 = matcher.rewrite(c1)
+    self.assertEqual(match_cnt, 1)
 
   def test_uop(self):
     matcher = PatternMatcher([(UPat(UOps.CONST, name="x"), lambda x: x)])
@@ -32,9 +44,9 @@ class TestPatternMatcher(TestUOps):
 
   def test_arg(self):
     matcher = PatternMatcher([
-      (UPat(UOps.CONST, 0, name="x"), lambda x: x),
-      (UPat(UOps.CONST, False, name="x"), lambda x: x),
-      (UPat(UOps.ALU, BinaryOps.MAX, name="x"), lambda x: x),
+      (UPat(UOps.CONST, arg=0, name="x"), lambda x: x),
+      (UPat(UOps.CONST, arg=False, name="x"), lambda x: x),
+      (UPat(UOps.ALU, arg=BinaryOps.MAX, name="x"), lambda x: x),
     ])
     c1 = UOp(UOps.CONST, dtypes.float, arg=0.0)
     c2 = UOp(UOps.CONST, dtypes.bool, arg=False)
@@ -49,7 +61,7 @@ class TestPatternMatcher(TestUOps):
 
   def test_filter_arg(self):
     matcher = PatternMatcher([
-      (UPat(UOps.ALU, BinaryOps.MUL, [UPat(UOps.CONST, name="c"), UPat(UOps.CONST, 2)], name="x"),
+      (UPat(UOps.ALU, arg=BinaryOps.MUL, src=[UPat(UOps.CONST, name="c"), UPat(UOps.CONST, arg=2)], name="x"),
        lambda x,c: x if c.arg in {1, -1} else None)
     ])
     y1 = UOp(UOps.CONST, dtypes.int, arg=1)
@@ -134,7 +146,7 @@ class TestPatternMatcher(TestUOps):
     c1 = UOp(UOps.CONST, dtypes.float, arg=1.0)
     c2 = UOp(UOps.CONST, dtypes.float, arg=2.0)
     c3 = UOp(UOps.CONST, dtypes.float, arg=3.0)
-    c4 = UOp(UOps.ALU, dtypes.float, (c1,), UnaryOps.NEG)
+    c4 = UOp(UOps.ALU, dtypes.float, (c1,), UnaryOps.EXP2)
     c5 = UOp(UOps.ALU, dtypes.float, (c1,c2), BinaryOps.ADD)
     c6 = UOp(UOps.ALU, dtypes.float, (c1,c2,c3), TernaryOps.MULACC)
     self.assertEqual(matcher.rewrite(c4), None)
@@ -161,26 +173,6 @@ class TestPatternMatcher(TestUOps):
       if isinstance(u.src, itertools.repeat): return next(u.src[0])
       return u.src[0]
     for a,b in zip(simple_src(a), simple_src(b)): self._assert_eq_upat(a, b)
-
-  def test_upat_str(self):
-    dtypes._float2 = dtypes.float.vec(2)
-    dtypes._float4 = dtypes.float.vec(4)
-    dtypes._float8 = dtypes.float.vec(8)
-    dtypes._float16 = dtypes.float.vec(16)
-    dtypes._half2 = dtypes.half.vec(2)
-    dtypes._half4 = dtypes.half.vec(4)
-    dtypes._half8 = dtypes.half.vec(8)
-    dtypes._half16 = dtypes.half.vec(16)
-    upat = UPat(UOps.CONST, name="x", dtype=dtypes.float)
-    assert str(upat) == str(eval(str(upat)))
-    evpat:UPat = eval(repr(UPat(src = [UPat(name='a'), UPat(name='b')])))
-    assert len(evpat.src) == 2
-    for i in range(20): upat = UPat(UOps.ALU, name="x", src=[upat, upat], arg=BinaryOps.ADD)
-    assert len(str(upat)) < 10_000
-    assert str(eval(str(upat))) == str(upat)
-    for rules in constant_folder.pdict.values():
-      for pat,_ in rules:
-        self._assert_eq_upat(pat, eval(str(pat)))
 
 if __name__ == '__main__':
   unittest.main(verbosity=2)

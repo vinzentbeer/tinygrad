@@ -1,8 +1,7 @@
 from typing import Dict, Callable, Any, List, Optional
 from llvmlite import ir
 from tinygrad.dtype import DType, PtrDType, dtypes
-from tinygrad.ops import Op, UnaryOps, BinaryOps, TernaryOps
-from tinygrad.codegen.uops import UOps, UOp
+from tinygrad.ops import Op, UnaryOps, BinaryOps, TernaryOps, UOps, UOp
 from tinygrad.renderer import Renderer
 
 MFLAGS = ('nsz', 'arcp', 'contract', 'afn', 'reassoc') # All from fast math, but nnan and ninf
@@ -54,8 +53,6 @@ class LLVMRenderer(Renderer):
   has_shared = False
   global_max = None
   code_for_op: Dict[Op, Callable] = {
-    UnaryOps.NEG: lambda builder, x, dtype: builder.neg(x) if dtypes.is_int(dtype) else \
-    (builder.not_(x) if dtype == dtypes.bool else builder.fneg(x, flags=MFLAGS)),
     UnaryOps.RECIP: lambda builder, x, dtype: builder.fdiv(const(1, dtype), x, flags=MFLAGS),
     UnaryOps.SQRT: lambda builder, x, dtype: builder.call(builder.module.declare_intrinsic('llvm.sqrt', [x.type]), [x], fastmath=MFLAGS),
     BinaryOps.ADD: lambda builder, x, y, dtype: builder.or_(x, y) if dtype == dtypes.bool else builder.add(x, y) if dtypes.is_int(dtype) else builder.fadd(x, y, flags=MFLAGS),  # noqa: E501
@@ -77,7 +74,7 @@ class LLVMRenderer(Renderer):
     buf_index = {x:i for i,x in enumerate(buf_to_dtype.keys())}
 
     # create llvm function
-    func_dtypes = [(dtype_to_llvm_dtype[dtype],dtype) for dtype in buf_to_dtype.values() if dtype is not None]
+    func_dtypes = [(dtype_to_llvm_dtype[dtype],dtype) for dtype in buf_to_dtype.values()]
     func = ir.Function(module, ir.FunctionType(ir.VoidType(), [x.as_pointer() if isinstance(dt, PtrDType) else x for x,dt in func_dtypes]), name=name)
     for a in func.args:
       if a.type.is_pointer: a.add_attribute("noalias")
@@ -108,7 +105,6 @@ class LLVMRenderer(Renderer):
         bb.append(ir.IRBuilder(func.append_basic_block(f"loop_exit_{len(loop_blocks)}")))
         bb[-2].cbranch(bb[-2].icmp_unsigned("<", idx_p1, lvars[src[0].src[1]]), loop_entry_bb, bb[-1].block)
       else:
-        assert dtype is not None, f"None dtype for uop {uop}"
         if uop is UOps.RANGE:
           bb.append(ir.IRBuilder(func.append_basic_block(f"loop_body_{len(loop_blocks)}")))
           bb[-2].branch(bb[-1].block)
@@ -134,11 +130,11 @@ class LLVMRenderer(Renderer):
           else:
             val = bb[-1].load(bb[-1].gep(lvars[src[0]], [lvars[src[1]]], inbounds=True))
           lvars[u] = val
-        elif uop is UOps.PHI:
+        elif uop is UOps.ASSIGN:
           lvars[u] = lvars[src[1]]
-          # PHI UOps can link to other PHI Uops, backtrace this to DEFINE_ACC
+          # ASSIGN UOps can link to other ASSIGN Uops, backtrace this to DEFINE_ACC
           backward = src[0]
-          while backward.op is UOps.PHI: backward = backward.src[0]
+          while backward.op is UOps.ASSIGN: backward = backward.src[0]
           lvars[backward] = lvars[u]
         elif uop is UOps.ALU:
           lvars[u] = self.code_for_op[args](bb[-1], *[lvars[x] for x in src], src[0].dtype if args in {BinaryOps.CMPLT, BinaryOps.CMPNE} else dtype)

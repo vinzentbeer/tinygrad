@@ -2,7 +2,8 @@
 import numpy as np
 import unittest
 from tinygrad import Tensor, Device, dtypes
-from tinygrad.lazy import LazyBuffer, ReduceOps, MetaOps
+from tinygrad.ops import UOps
+from tinygrad.lazy import LazyBuffer, MetaOps
 from tinygrad.engine.schedule import create_schedule
 
 class TestLazyBuffer(unittest.TestCase):
@@ -61,12 +62,12 @@ class TestLazyBuffer(unittest.TestCase):
 
   def test_const_dtype(self):
     lb: LazyBuffer = Tensor([1], dtype=dtypes.int).lazydata
-    assert lb.const(1).base.arg == 1
-    assert type(lb.const(1).base.arg) is int
+    assert lb.const_like(1).base.arg == 1
+    assert type(lb.const_like(1).base.arg) is int
 
     lb: LazyBuffer = Tensor([1], dtype=dtypes.float).lazydata
-    assert lb.const(1).base.arg == 1.0
-    assert type(lb.const(1).base.arg) is float
+    assert lb.const_like(1).base.arg == 1.0
+    assert type(lb.const_like(1).base.arg) is float
 
 class TestReduceOp(unittest.TestCase):
   def test_no_split_reduce_kernel(self):
@@ -74,7 +75,7 @@ class TestReduceOp(unittest.TestCase):
     a = a.sum()
     sched = create_schedule([a.lazydata])
     assert len(sched) == 1
-    self.assertIs(sched[0].ast.src[0].src[0].op, ReduceOps.SUM)
+    self.assertIs(sched[0].ast.src[0].src[2].op, UOps.REDUCE_AXIS)
 
   def test_split_reduce_kernel_dim0(self):
     a = Tensor.rand(256, 255).realize()
@@ -82,7 +83,7 @@ class TestReduceOp(unittest.TestCase):
     sched = create_schedule([a.lazydata])
     assert len(sched) == 2
     for s in sched:
-      self.assertIs(s.ast.src[0].src[0].op, ReduceOps.SUM)
+      self.assertIs(s.ast.src[0].src[2].op, UOps.REDUCE_AXIS)
 
   def test_split_reduce_kernel_dim1(self):
     a = Tensor.rand(255, 256).realize()
@@ -90,7 +91,7 @@ class TestReduceOp(unittest.TestCase):
     sched = create_schedule([a.lazydata])
     assert len(sched) == 2
     for s in sched:
-      self.assertIs(s.ast.src[0].src[0].op, ReduceOps.SUM)
+      self.assertIs(s.ast.src[0].src[2].op, UOps.REDUCE_AXIS)
 
 class TestView(unittest.TestCase):
   def test_all_masked_out(self):

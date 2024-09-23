@@ -1,14 +1,14 @@
-from typing import List
+from typing import List, Tuple
 from extra.models.resnet import ResNet50
 from extra.mcts_search import mcts_search
 from examples.mlperf.helpers import get_mlperf_bert_model
 from tinygrad import Tensor, Device, dtypes, nn
 from tinygrad.codegen.kernel import Kernel
+from tinygrad.ops import UOps
 from tinygrad.device import Compiled
 from tinygrad.engine.schedule import create_schedule
 from tinygrad.engine.search import time_linearizer, beam_search, bufs_from_lin
 from tinygrad.helpers import DEBUG, ansilen, getenv, colored
-from tinygrad.ops import MetaOps
 from tinygrad.shape.symbolic import sym_infer
 
 def get_sched_resnet():
@@ -17,7 +17,6 @@ def get_sched_resnet():
   BS = getenv("BS", 64)
 
   # run model twice to get only what changes, these are the kernels of the model
-  seen = set()
   for _ in range(2):
     out = mdl(Tensor.empty(BS, 3, 224, 224))
     targets = [out.lazydata]
@@ -25,7 +24,7 @@ def get_sched_resnet():
       optim.zero_grad()
       out.sparse_categorical_crossentropy(Tensor.empty(BS, dtype=dtypes.int)).backward()
       targets += [x.lazydata for x in optim.schedule_step()]
-    sched = create_schedule(targets, seen)
+    sched = create_schedule(targets)
     print(f"schedule length {len(sched)}")
   return sched
 
@@ -68,7 +67,7 @@ if __name__ == "__main__":
   print(f"optimizing for {Device.DEFAULT}")
 
   sched = globals()[f"get_sched_{getenv('MODEL', 'resnet')}"]()
-  sched = [x for x in sched if x.ast.op is MetaOps.KERNEL]
+  sched = [x for x in sched if x.ast.op is UOps.SINK]
 
   # focus on one kernel
   if getenv("KERNEL", -1) >= 0: sched = sched[getenv("KERNEL", -1):getenv("KERNEL", -1)+1]
@@ -83,7 +82,7 @@ if __name__ == "__main__":
     rawbufs = bufs_from_lin(Kernel(si.ast))
 
     # "linearize" the op into uops in different ways
-    lins:List[Kernel] = []
+    lins: List[Tuple[Kernel, str]] = []
 
     # always try hand coded opt
     lin = Kernel(si.ast, opts=device.renderer)
@@ -109,10 +108,10 @@ if __name__ == "__main__":
 
     # benchmark the programs
     choices = []
-    for (lin, nm) in lins:
+    for lin, nm in lins:
       tm = time_linearizer(lin, rawbufs, allow_test_size=False, cnt=10, disable_cache=True)
       ops = (prg:=lin.to_program()).op_estimate
-      gflops = sym_infer(ops, {k:k.min for k in lin.ast.vars()})*1e-9/tm
+      gflops = sym_infer(ops, {k:k.min for k in lin.ast.variables()})*1e-9/tm
       choices.append((tm, gflops, lin, prg, nm))
 
     sorted_choices = sorted(choices, key=lambda x: x[0])

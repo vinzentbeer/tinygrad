@@ -2,8 +2,7 @@ from typing import Optional, List, Tuple, Dict, Callable, Any
 import functools
 from dataclasses import dataclass, field
 from tinygrad.helpers import to_function_name, dedup
-from tinygrad.codegen.uops import UOps, UOp, flops_mem
-from tinygrad.ops import Op
+from tinygrad.ops import Op, UOps, UOp, flops_mem
 from tinygrad.shape.symbolic import sym_infer, sint, Variable
 from tinygrad.dtype import DType
 
@@ -35,18 +34,15 @@ class Program:
     if not self._ran_post_init and self.uops is not None:
       # single pass through the uops
       for u in self.uops:
-        if u.op is UOps.DEFINE_VAR: self.vars.append(u.arg)
+        if u.op is UOps.DEFINE_VAR: self.vars.append(Variable(u.arg[0], u.arg[1], u.arg[2]))
         if u.op is UOps.DEFINE_GLOBAL: self.globals.append(u.arg)
         if u.op is UOps.STORE: self.outs.extend([x.arg for x in u.src[0].sparents if x.op is UOps.DEFINE_GLOBAL])
         if u.op is UOps.SPECIAL:
           # NOTE: you have to set local_size and global_size to the base [1,1,1] outside this
           if u.arg[0][0] == 'i': self.local_size = None
-          if u.arg[0][0] == 'l':
-            assert self.local_size is not None
-            self.local_size[int(u.arg[0][-1])] = u.arg[1]
-          else:
-            assert self.global_size is not None
-            self.global_size[int(u.arg[0][-1])] = u.arg[1]
+          special_size = self.local_size if u.arg[0][0] == 'l' else self.global_size
+          assert special_size is not None
+          special_size[int(u.arg[0][-1])] = u.arg[1]
       self.vars = sorted(self.vars, key=lambda v: v.expr)
       self.outs = sorted(dedup(self.outs))
       self._ran_post_init = True
