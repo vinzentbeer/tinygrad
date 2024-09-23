@@ -105,6 +105,14 @@ class UOps(FastEnum):
   NOOP = auto()
   GEP = auto()
 
+  # ops that are not graph nodes
+  ENDRANGE = auto()
+  ENDIF = auto()
+
+  # memory ops
+  ASSIGN = auto()
+  LOAD = auto()
+
   # math ops
   CAST = auto()
   BITCAST = auto()
@@ -114,19 +122,13 @@ class UOps(FastEnum):
   REDUCE_AXIS = auto()
   WMMA = auto()
 
-  # memory/assignment ops
-  LOAD = auto()
+  # stores last
   STORE = auto()
-  ASSIGN = auto()
 
   # control flow ops
   BARRIER = auto()
   IF = auto()
   RANGE = auto()
-
-  # ops that are not graph nodes
-  ENDRANGE = auto()
-  ENDIF = auto()
 
 BUFFER_UOPS = {UOps.LOAD, UOps.STORE, UOps.VALID}
 COMMUTATIVE = {BinaryOps.ADD, BinaryOps.MUL, BinaryOps.MAX, BinaryOps.CMPNE, BinaryOps.XOR, BinaryOps.AND, BinaryOps.OR}

@@ -746,6 +746,7 @@ def linearize_uop(sink:UOp, skip_check:bool=not __debug__) -> List[UOp]:
   queue:List[Tuple[int, UOp]] = []
   def push(u:UOp):
     priority = 0
+    """
     # prefer ranges that depend on the least number of independent ranges
     if u.op is UOps.RANGE and u.arg[1]:
       priority += u.arg[0]
@@ -754,6 +755,7 @@ def linearize_uop(sink:UOp, skip_check:bool=not __debug__) -> List[UOp]:
     # prefer uops that are loop children
     else:
       priority -= sum([(l.arg[0]+1) + 1000*l.arg[1] for l,ss in scope_children.items() if l.op is UOps.RANGE and u in ss])
+    """
     heapq.heappush(queue, (priority, u))
 
   for u in children:
@@ -763,7 +765,7 @@ def linearize_uop(sink:UOp, skip_check:bool=not __debug__) -> List[UOp]:
   _uops: List[UOp] = []
   while queue:
     p,x = heapq.heappop(queue)
-    if DEBUG >= 7: print(f"{p:5d}",x)
+    if DEBUG >= 7: print(f"{p:5d}",x.op, x.dtype, x.arg)
     if x in scope_children: scope_end[x] = x
     if x.op is UOps.DEFINE_ACC:
       idx = min([_uops.index(l) for l in x.src if l.op is UOps.RANGE])
