@@ -6,11 +6,11 @@ RUN apt update && apt install -y git curl python3-pip && rm -rf /var/lib/apt/lis
 ENV DEBIAN_FRONTEND=noninteractive
 RUN echo 'Acquire::http::Pipeline-Depth "5";' > /etc/apt/apt.conf.d/99parallel \
     && apt-get update && apt-get install -y --no-install-recommends wget gnupg \
-    && wget https://repo.radeon.com/rocm/rocm.gpg.key -O - | gpg --dearmor > /etc/apt/keyrings/rocm.gpg \
-    && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/debian jammy main" > /etc/apt/sources.list.d/rocm.list \
+    && wget https://repo.radeon.com/rocm/rocm.gpg.key -O - | gpg --dearmor | tee /etc/apt/keyrings/rocm.gpg > /dev/null \
+    && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/6.1.2 jammy main" > /etc/apt/sources.list.d/rocm.list \
     && echo -e 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600' > /etc/apt/preferences.d/rocm-pin-600 \
     && apt-get update \
-    && apt-get install --no-install-recommends --allow-unauthenticated -y hsa-rocr comgr hsa-rocr-dev liburing-dev libc6-dev rocm-llvm \
+    && apt-get install --no-install-recommends --allow-unauthenticated -y comgr rocm-llvm \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
