@@ -3,17 +3,16 @@ import numpy as np
 import torch
 from typing import Any, List
 from tinygrad.helpers import getenv, DEBUG, CI
-from tinygrad.dtype import DType, DTYPES_DICT, ImageDType, PtrDType, least_upper_float, least_upper_dtype
+from tinygrad.dtype import DType, DTYPES_DICT, ImageDType, PtrDType, least_upper_float, least_upper_dtype, truncate_fp16
 from tinygrad import Device, Tensor, dtypes
 from tinygrad.tensor import _to_np_dtype
-from tinygrad.ops import truncate_fp16
 from hypothesis import given, settings, strategies as strat
 from test.helpers import is_dtype_supported, rand_for_dtype
 
 settings.register_profile("my_profile", max_examples=200, deadline=None, derandomize=getenv("DERANDOMIZE_CI", False))
 settings.load_profile("my_profile")
 
-core_dtypes = list([v for k,v in DTYPES_DICT.items() if k != 'pyint'])
+core_dtypes = list(DTYPES_DICT.values())
 if Device.DEFAULT == "CPU": core_dtypes.remove(dtypes.bfloat16)  # NOTE: this is for teenygrad, don't remove
 dtype_ints = [dt for dt in core_dtypes if dtypes.is_int(dt) and is_dtype_supported(dt)]
 dtype_floats = [dt for dt in core_dtypes if dtypes.is_float(dt) and is_dtype_supported(dt)]
@@ -21,7 +20,7 @@ dtype_floats = [dt for dt in core_dtypes if dtypes.is_float(dt) and is_dtype_sup
 def get_available_cast_dtypes(dtype: DType) -> List[DType]:
   if not is_dtype_supported(dtype): return []
   # dont cast internal dtypes
-  return [v for k, v in DTYPES_DICT.items() if v != dtype and is_dtype_supported(v) and not k.startswith("_") and k != 'pyint']
+  return [v for k, v in DTYPES_DICT.items() if v != dtype and is_dtype_supported(v) and not k.startswith("_")]
 
 def _test_to_np(a:Tensor, np_dtype, target):
   if DEBUG >= 2: print(a)
@@ -72,6 +71,7 @@ class TestDType(unittest.TestCase):
   def test_to_np(self):
     _test_to_np(Tensor(self.DATA, dtype=self.DTYPE), _to_np_dtype(self.DTYPE), np.array(self.DATA, dtype=_to_np_dtype(self.DTYPE)))
 
+  @np.errstate(all='ignore')
   def test_casts_to(self): list(map(
     lambda dtype: _test_cast(Tensor(self.DATA, dtype=dtype), self.DTYPE),
     get_available_cast_dtypes(self.DTYPE)
@@ -313,15 +313,15 @@ class TestEqStrDType(unittest.TestCase):
   def test_ptr_ne(self):
     if PtrDType is None: raise unittest.SkipTest("no PtrDType support")
     # TODO: is this the wrong behavior?
-    assert PtrDType(dtypes.float32) == dtypes.float32
-    assert not (PtrDType(dtypes.float32) != dtypes.float32)
-    assert PtrDType(dtypes.float32) == PtrDType(dtypes.float32)
-    assert not (PtrDType(dtypes.float32) != PtrDType(dtypes.float32))
-    #assert PtrDType(dtypes.float32) != dtypes.float32
+    assert dtypes.float32.ptr() == dtypes.float32
+    assert not (dtypes.float32.ptr() != dtypes.float32)
+    assert dtypes.float32.ptr() == dtypes.float32.ptr()
+    assert not (dtypes.float32.ptr() != dtypes.float32.ptr())
+    #assert dtypes.float32.ptr() != dtypes.float32
   def test_strs(self):
     if PtrDType is None: raise unittest.SkipTest("no PtrDType support")
     self.assertEqual(str(dtypes.imagef((1,2,4))), "dtypes.imagef((1, 2, 4))")
-    self.assertEqual(str(PtrDType(dtypes.float32)), "PtrDType(dtypes.float)")
+    self.assertEqual(str(dtypes.float32.ptr()), "dtypes.float.ptr()")
 
 class TestHelpers(unittest.TestCase):
   signed_ints = (dtypes.int8, dtypes.int16, dtypes.int32, dtypes.int64)
@@ -421,6 +421,7 @@ class TestTypeSpec(unittest.TestCase):
       subprocess.run(['DEFAULT_FLOAT=TYPO python3 -c "from tinygrad import dtypes"'],
                       shell=True, check=True)
 
+  @np.errstate(all='ignore')
   def test_dtype_str_arg(self):
     n = np.random.normal(0, 1, (10, 10)).astype(np.float32)
     tested = 0
@@ -579,7 +580,7 @@ class TestAutoCastType(unittest.TestCase):
   def tearDown(self):
     dtypes.default_int, dtypes.default_float = self.old_default_int, self.old_default_float
 
-  @given(strat.sampled_from([d for d in DTYPES_DICT.values() if dtypes.is_int(d) and is_dtype_supported(d)]))
+  @given(strat.sampled_from([d for d in core_dtypes if dtypes.is_int(d) and is_dtype_supported(d)]))
   def test_int_to_float_unary_func(self, dtype):
     for func in [
       lambda t: t.exp(),
@@ -761,6 +762,25 @@ class TestAutoCastType(unittest.TestCase):
     t.square().mean().backward()
     np.testing.assert_allclose(t.grad.numpy().flatten(), [60000 * 2 / (N*N)] * N*N)
 
+  @unittest.skipUnless(is_dtype_supported(dtypes.half), "need half")
+  def test_softmax_dtype(self):
+    data = [1, 2, 3]
+    t = Tensor(data, dtype=dtypes.half)
+    tt = torch.tensor(data, dtype=torch.half)
+
+    out = t.softmax(0)
+    self.assertEqual(out.dtype, dtypes.half)
+    np.testing.assert_allclose(out.numpy(), tt.softmax(0).numpy(), rtol=1e-3)
+    out = t.softmax(0, dtype=dtypes.float)
+    self.assertEqual(out.dtype, dtypes.float)
+    np.testing.assert_allclose(out.numpy(), tt.softmax(0, dtype=torch.float).numpy(), rtol=1e-3)
+    out = t.log_softmax(0)
+    self.assertEqual(out.dtype, dtypes.half)
+    np.testing.assert_allclose(out.numpy(), tt.log_softmax(0).numpy(), rtol=1e-3)
+    out = t.log_softmax(0, dtype=dtypes.float)
+    self.assertEqual(out.dtype, dtypes.float)
+    np.testing.assert_allclose(out.numpy(), tt.log_softmax(0, dtype=torch.float).numpy(), rtol=1e-3)
+
 class TestImplicitFunctionTypeChange(unittest.TestCase):
   def test_functions(self):
     result = []
@@ -783,6 +803,12 @@ class TestTensorMethod(unittest.TestCase):
     a, b = Tensor([2], dtype=dt), Tensor([1], dtype=dt)
     ret = (a - b).abs()
     np.testing.assert_allclose(ret.numpy(), np.abs(a.numpy()-b.numpy()))
+
+class TestDtypeUsage(unittest.TestCase):
+  def test_max_w_alu(self):
+    for d in dtypes.ints:
+      t = Tensor([[1, 2], [3, 4]], dtype=d)
+      (t*t).max().item()
 
 if __name__ == '__main__':
   unittest.main()

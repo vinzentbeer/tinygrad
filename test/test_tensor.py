@@ -1,10 +1,10 @@
 import subprocess
 import numpy as np
 import torch
-import unittest, copy, mmap, random, math
+import unittest, copy, mmap, random, math, array
 from tinygrad import Tensor, Device, dtypes
 from tinygrad.engine.schedule import create_schedule
-from tinygrad.helpers import getenv, temp, CI, _METADATA
+from tinygrad.helpers import getenv, temp, CI, _METADATA, mv_address
 from extra.gradcheck import numerical_jacobian, jacobian, gradcheck
 from hypothesis import given, settings, strategies as strat
 from test.helpers import is_dtype_supported
@@ -330,6 +330,17 @@ class TestTinygrad(unittest.TestCase):
     assert Tensor(arr, dtype=dtypes.float32).dtype == dtypes.float32 # check if ndarray correctly casts to Tensor dtype
     assert Tensor(arr, dtype=dtypes.float64).dtype == dtypes.float64 # check that it works for something else
 
+  def test_tensor_from_blob(self):
+    x = memoryview(bytearray(16)).cast('I')
+
+    t = Tensor.from_blob(mv_address(x), (4,), dtype=dtypes.int, device="CLANG")
+    z = (t+1)
+    np.testing.assert_equal(z.numpy(), [1, 1, 1, 1])
+
+    x[:] = array.array('I', [0, 1, 2, 3])
+    z = (t+1)
+    np.testing.assert_equal(z.numpy(), [1, 2, 3, 4])
+
   def test_tensor_list_dtype(self):
     for arr in ([1], [[[1]]], [[1,1],[1,1]], [[[1,1],[1,1]],[[1,1],[1,1]]]):
       assert Tensor(arr).dtype == dtypes.default_int
@@ -388,7 +399,7 @@ class TestTinygrad(unittest.TestCase):
     if is_dtype_supported(dtypes.float16):
       data = [math.nan, -math.inf, 65504, 65519, 65519.999, 65520, 65520.1]
       data = data + [-x for x in data]
-      np.testing.assert_allclose(Tensor(data, dtype=dtypes.float16).numpy(), np.array(data).astype(np.float16))
+      with np.errstate(over='ignore'): np.testing.assert_allclose(Tensor(data, dtype=dtypes.float16).numpy(), np.array(data).astype(np.float16))
 
     # uint32
     data = [1 << 33, 1 << 32, 1 << 32 - 1, 1]
