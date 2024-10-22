@@ -603,7 +603,7 @@ class PatternMatcher:
   def __add__(self, more:PatternMatcher): return PatternMatcher(self.patterns+more.patterns)
 
   def rewrite(self, uop:UOp, ctx=None) -> Optional[UOp]:
-    assert not ASSERT_REWRITE, f"tried to rewrite while ASSERT_REWRITE set\n{'\n'.join(p.printable() for p,_ in self.patterns)}"
+    assert not ASSERT_REWRITE, "tried to rewrite while ASSERT_REWRITE set\n"+"\n".join(p.printable() for p,_ in self.patterns)
     ler = set([v for u in uop.src for v in ((u.op, u.arg), (u.op, None))])
     for p,fxn,early_reject in self.pdict.get((uop.op, uop.arg), []) + ([] if uop.arg is None else self.pdict.get((uop.op, None), [])):
       if not early_reject.issubset(ler): continue
