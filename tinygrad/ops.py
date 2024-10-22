@@ -5,7 +5,7 @@ from enum import auto, IntEnum, Enum
 from dataclasses import dataclass, field
 from weakref import WeakValueDictionary
 from tinygrad.dtype import ConstType, ImageDType, PtrDType, dtypes, DType, truncate
-from tinygrad.helpers import ContextVar, prod, getenv, all_same, Context, partition
+from tinygrad.helpers import ASSERT_REWRITE, ContextVar, prod, getenv, all_same, Context, partition
 if TYPE_CHECKING:
   from tinygrad.shape.shapetracker import ShapeTracker
 
@@ -603,6 +603,7 @@ class PatternMatcher:
   def __add__(self, more:PatternMatcher): return PatternMatcher(self.patterns+more.patterns)
 
   def rewrite(self, uop:UOp, ctx=None) -> Optional[UOp]:
+    assert not ASSERT_REWRITE, f"tried to rewrite while ASSERT_REWRITE set\n{'\n'.join(p.printable() for p,_ in self.patterns)}"
     ler = set([v for u in uop.src for v in ((u.op, u.arg), (u.op, None))])
     for p,fxn,early_reject in self.pdict.get((uop.op, uop.arg), []) + ([] if uop.arg is None else self.pdict.get((uop.op, None), [])):
       if not early_reject.issubset(ler): continue

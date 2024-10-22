@@ -13,7 +13,7 @@ from tinygrad.dtype import DType
 from tinygrad.shape.shapetracker import ShapeTracker
 from tinygrad.shape.view import View
 from tinygrad.ops import BinaryOps, MetaOps, UOp, UnaryOps, UOps, graph_rewrite, track_rewrites
-from tinygrad.helpers import CI, DEBUG, FUSE_ARANGE, GlobalCounters, flatten, getenv, SPLIT_REDUCEOP, unwrap, prod, Context
+from tinygrad.helpers import CI, DEBUG, FUSE_ARANGE, LAZYCACHE, GlobalCounters, flatten, getenv, SPLIT_REDUCEOP, unwrap, prod, Context
 from tinygrad.codegen.kernel import Kernel, verify_ast
 from tinygrad.engine.schedule import BUF_LIMIT, create_schedule, view_right, st_fixup, view_left
 from tinygrad.engine.realize import CompiledRunner, run_schedule
@@ -1794,6 +1794,31 @@ class TestIndexing(unittest.TestCase):
     def rewrite(sink): return graph_rewrite(graph_rewrite(sink, view_left), view_right)
     ret = rewrite(sink)
     assert len([x for x in ret.sparents if x.op is UOps.VIEW and len(x.src) != 0]) == 0, f"unmerged views left in sink {ret}"
+
+# schedule_cache replaces LAZYCACHE=1!
+def create_schedule_with_cache(outs:List[LazyBuffer]):
+  with Context(ASSERT_REWRITE=1): return create_schedule(list(outs))
+
+class TestScheduleCache(unittest.TestCase):
+  def setUp(self):
+    self.prev_lazycache = LAZYCACHE.value
+    LAZYCACHE.value = 0
+  def tearDown(self): LAZYCACHE.value = self.prev_lazycache
+
+  def test_tiny_add(self):
+    a = Tensor([1]).realize()
+    b = Tensor([2]).realize()
+    x1 = a+b
+    x2 = a+b
+    self.assertIsNot(x1, x2)
+    s1 = create_schedule([x1.lazydata])[0]
+    s2 = create_schedule_with_cache([x2.lazydata])[0]
+    # NOTE: same compute, different Buffers
+    self.assertIs(s1.ast, s2.ast)
+    self.assertIsNot(s1.outputs, s2.outputs)
+    run_schedule([s1, s2])
+    self.assertEqual(x1.numpy(), x2.numpy())
+    self.assertEqual(x1.numpy(), 3)
 
 if __name__ == '__main__':
   unittest.main(verbosity=2)
