@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, functools, platform, time, re, contextlib, operator, hashlib, pickle, sqlite3, tempfile, pathlib, string, ctypes, sys, gzip
+import os, functools, platform, time, re, contextlib, operator, hashlib, pickle, sqlite3, tempfile, pathlib, string, ctypes, sys, gzip, atexit
 import urllib.request, subprocess, shutil, math, contextvars, types, copyreg, inspect, importlib
 from dataclasses import dataclass
 from typing import Dict, Tuple, Union, List, ClassVar, Optional, Iterable, Any, TypeVar, TYPE_CHECKING, Callable, Sequence
@@ -115,6 +115,16 @@ class Metadata:
   def __repr__(self): return str(self) + (f" - {self.caller}" if self.caller else "")
   def __str__(self): return self.name + (" bw" if self.backward else "")
 _METADATA: contextvars.ContextVar[Optional[Metadata]] = contextvars.ContextVar("_METADATA", default=None)
+
+# **************** process replay ****************
+
+REPLAY_CAPTURE: Dict[int, Tuple[Tuple, Dict, Any]]  = {}
+def process_replay(fxn):
+  atexit.register(lambda: [diskcache_put("schedule_process_replay", k, v) for k,v in REPLAY_CAPTURE.items()])
+  def wrapper(*args, **kwargs):
+    REPLAY_CAPTURE[id(args[0])] = (args, kwargs, ret:=fxn(*args, **kwargs))
+    return ret
+  return wrapper if getenv("RUN_PROCESS_REPLAY") else fxn
 
 # **************** global state Counters ****************
 

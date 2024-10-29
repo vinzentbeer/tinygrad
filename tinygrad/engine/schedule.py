@@ -1,9 +1,9 @@
-import sys, atexit, functools, itertools
+import sys, functools, itertools
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Callable, Set, Tuple, List, Dict, Optional, DefaultDict, cast
 from tinygrad.ops import BUFFER_UOPS, MetaOps, ReduceOps, UnaryOps, UOp, UOps, PatternMatcher, UPat, Variable, graph_rewrite, track_rewrites, sint
-from tinygrad.helpers import DEBUG, Metadata, all_same, colored, diskcache_put, prod, dedup, getenv, unwrap
+from tinygrad.helpers import DEBUG, Metadata, all_same, colored, process_replay, prod, dedup, unwrap
 from tinygrad.dtype import ImageDType, dtypes
 from tinygrad.shape.shapetracker import ShapeTracker
 from tinygrad.shape.view import View, strides_for_shape
@@ -200,6 +200,7 @@ multioutput = PatternMatcher([
   (UPat.load(UPat.var("b"), UPat()), lambda stores,b: stores.get(b)),
 ])
 
+@process_replay
 def full_ast_rewrite(pre:UOp, ctx:ScheduleItemContext) -> UOp:
   # fuse and fold store -> loads
   sink = graph_rewrite(pre, lazy)
@@ -219,14 +220,7 @@ def full_ast_rewrite(pre:UOp, ctx:ScheduleItemContext) -> UOp:
         and ShapeTracker.from_shape(s.shape).shrink(m) == s.shrink(m)) for x in sink.sparents if x.op is UOps.LOAD and x.src[0] in assign_targets):
       raise RuntimeError("self operand of augmented assign must be contiguous.\nhelp: consider using .contiguous():\n"
                          +colored("   - a += a.T\n", "red")+colored("   + a += a.T.contiguous()", "green"))
-  if getenv("RUN_PROCESS_REPLAY"): PROCESS_REPLAY_CAPTURE.append((pre, ScheduleItemContext(ctx.var_vals, ctx.assigned), sink))
   return sink
-
-PROCESS_REPLAY_CAPTURE: List[Tuple[UOp, ScheduleItemContext, UOp]] = []
-if getenv("RUN_PROCESS_REPLAY"):
-  @atexit.register
-  def save_process_replay():
-    for base_sink,ctx,ret in PROCESS_REPLAY_CAPTURE: diskcache_put("schedule_process_replay", str(base_sink.key), (base_sink, ctx, {}, ret))
 
 # **** Schedule creation and BFS toposort
 
