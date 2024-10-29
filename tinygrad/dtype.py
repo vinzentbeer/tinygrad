@@ -6,7 +6,7 @@ from tinygrad.helpers import getenv
 
 ConstType = Union[float, int, bool]
 
-@dataclass(frozen=True, order=True)
+@dataclass(frozen=True)
 class DType:
   priority: int  # this determines when things get upcasted
   itemsize: int
@@ -14,15 +14,16 @@ class DType:
   fmt: Optional[str]
   count: int
   def __repr__(self): return f"dtypes.{INVERSE_DTYPES_DICT[self.scalar().name]}"+(f".vec({self.count})" if self.count > 1 else "")
+  def __lt__(self, o:DType): return (self.priority, self.itemsize, self.name, self.fmt, self.count) < (o.priority, o.itemsize, o.name, o.fmt, o.count)
   def vec(self, sz:int):
     assert self.count == 1, f"can't vectorize {self} with size {sz}"
     if sz == 1 or self.name == 'void': return self  # void doesn't vectorize, and sz=1 is scalar
     return DType(self.priority, self.itemsize*sz, f"{INVERSE_DTYPES_DICT[self.name]}{sz}", None, sz)
-  def ptr(self, local=False) -> Union[PtrDType, ImageDType]: return PtrDType(self, local)
+  def ptr(self, local=False) -> Union[PtrDType, ImageDType]:
+    return PtrDType(self.priority, self.itemsize, self.name, self.fmt, self.count, self, local)
   def scalar(self) -> DType: return DTYPES_DICT[self.name[:-len(str(self.count))]] if self.count > 1 else self
 
-# dependent typing?
-@dataclass(frozen=True, repr=False)
+@dataclass(frozen=True)
 class ImageDType(DType):
   shape: Tuple[int, ...]   # arbitrary arg for the dtype, used in image for the shape
   base: DType
@@ -32,11 +33,12 @@ class ImageDType(DType):
   def ptr(self, local=False) -> Union[PtrDType, ImageDType]: return self
   def __repr__(self): return f"dtypes.{self.name}({self.shape})"
 
+@dataclass(frozen=True)
 class PtrDType(DType):
-  def __init__(self, dt:DType, local=False):
-    self.base, self.local = dt, local
-    super().__init__(dt.priority, dt.itemsize, dt.name, dt.fmt, dt.count)
+  base: DType
+  local: bool
   def __hash__(self): return super().__hash__()
+  # local isn't used in the compare
   def __eq__(self, dt): return self.priority==dt.priority and self.itemsize==dt.itemsize and self.name==dt.name and self.count==dt.count
   def __ne__(self, dt): return not (self == dt)
   def __repr__(self): return f"{super().__repr__()}.ptr(local=True)" if self.local else f"{super().__repr__()}.ptr()"
