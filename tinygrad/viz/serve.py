@@ -2,7 +2,7 @@
 import multiprocessing, pickle, functools, difflib, os, threading, json, time, sys, webbrowser, socket
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Tuple, Optional
 from tinygrad.helpers import colored, getenv, to_function_name, tqdm, unwrap, word_wrap
 from tinygrad.ops import TrackedRewriteContext, UOp, UOps, lines
@@ -30,13 +30,13 @@ class GraphRewriteMetadata:
 @dataclass
 class GraphRewriteDetails(GraphRewriteMetadata):
   """Full details about a single call to graph_rewrite"""
-  graphs: List[UOp]
+  graphs: List[UOp] = field(default_factory=list)
   """Sink at every step of graph_rewrite"""
-  diffs: List[List[str]]
+  diffs: List[List[str]] = field(default_factory=list)
   """.diff style before and after of the rewritten UOp child"""
-  changed_nodes: List[List[int]]
+  changed_nodes: List[List[int]] = field(default_factory=list)
   """Nodes that changed at every step of graph_rewrite"""
-  kernel_code: Optional[str]
+  kernel_code: Optional[str] = None
   """The program after all rewrites"""
 
 # ** API functions
@@ -75,7 +75,8 @@ def _prg(k:Optional[Kernel]) -> Optional[str]:
   try: return k.to_program().src if isinstance(k, Kernel) else None
   except Exception: return None
 def get_details(k:Any, ctx:TrackedRewriteContext, metadata:GraphRewriteMetadata) -> GraphRewriteDetails:
-  g = GraphRewriteDetails(**asdict(metadata), graphs=[ctx.sink], diffs=[], changed_nodes=[], kernel_code=pcall(_prg, k))
+  if len(ctx.sink.sparents) > 0: return GraphRewriteDetails(**asdict(metadata), kernel_code="GRAPH TOO BIG\n"+(pcall(_prg, k) or ""))
+  g = GraphRewriteDetails(**asdict(metadata), graphs=[ctx.sink], kernel_code=pcall(_prg, k))
   replaces: Dict[UOp, UOp] = {}
   sink = ctx.sink
   for i,(u0,u1,upat,_) in enumerate(ctx.matches):
